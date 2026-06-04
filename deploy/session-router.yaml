@@ -1,0 +1,92 @@
+# =============================================================================
+# Session Router — stateless service that maps (dev,project) -> warm pod
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: session-control
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-config
+  namespace: session-control
+data:
+  IDLE_EVICT_SECONDS: "900"          # 15 min
+  MAX_CONCURRENT_PER_DEV: "3"
+  DAILY_BUDGET_USD_PER_DEV: "50"
+  POOL_NAMESPACE: "agent-pool"
+  POD_LABEL_SELECTOR: "app=agent-pod,state=warm"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: session-router
+  namespace: session-control
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: session-router } }
+  template:
+    metadata:
+      labels: { app: session-router }
+    spec:
+      serviceAccountName: session-router
+      containers:
+        - name: router
+          image: acrtheclouds.azurecr.io/code-forge/session-router:1.0.0
+          ports: [{ containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: router-config }
+          env:
+            - name: REDIS_URL
+              valueFrom: { secretKeyRef: { name: redis-conn, key: url } }
+            - name: SERVICE_BUS_CONN
+              valueFrom: { secretKeyRef: { name: sb-conn, key: connection } }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits:   { cpu: 1,    memory: 512Mi }
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: session-router
+  namespace: session-control
+spec:
+  selector: { app: session-router }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+# Workload identity to talk to KV + AKS API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: session-router
+  namespace: session-control
+  annotations:
+    azure.workload.identity/client-id: "REPLACE-WITH-UAMI-CLIENT-ID"
+---
+# RBAC: router can label/patch agent pods to bind/release them
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: pod-allocator }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get","list","watch","patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get","create","delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: session-router-allocator }
+subjects:
+  - kind: ServiceAccount
+    name: session-router
+    namespace: session-control
+roleRef:
+  kind: ClusterRole
+  name: pod-allocator
+  apiGroup: rbac.authorization.k8s.io
