@@ -157,6 +157,9 @@ module foundry 'modules/foundry.bicep' = {
     keyVaultId: keyvault.outputs.kvId
     storageId: storage.outputs.storageId
     logAnalyticsWorkspaceId: logging.outputs.workspaceId
+    aksOidcIssuerUrl: aks.outputs.oidcIssuerUrl
+    gatewayIdentityId: identity.outputs.gatewayIdentityId
+    gatewayIdentityPrincipalId: identity.outputs.gatewayIdentityPrincipalId
   }
 }
 
