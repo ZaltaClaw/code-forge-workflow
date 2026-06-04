@@ -4,18 +4,17 @@ Usage:
     python examples/run.py "build a stable URL slugifier"
     python examples/run.py            # uses a default demo task
 
-Outputs:
-    runs/<timestamp>/spec.md
-    runs/<timestamp>/implementation.py
-    runs/<timestamp>/tests.py
-    runs/<timestamp>/security_report.md
-    runs/<timestamp>/README.md
-    runs/<timestamp>/trace.txt
+Provider selection (Microsoft Agent Framework + Claude Agent SDK):
+    CODE_FORGE_PROVIDERS=mixed       # default: Claude reviews, OpenAI everything else
+    CODE_FORGE_PROVIDERS=all-openai
+    CODE_FORGE_PROVIDERS=all-claude
+    CODE_FORGE_PROVIDERS="security_reviewer=claude,implementer=claude"   # per-role
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import sys
 from pathlib import Path
@@ -34,6 +33,30 @@ DEFAULT_TASK = (
 )
 
 
+@contextlib.asynccontextmanager
+async def agent_lifecycle(agents: dict):
+    """Stop any agents that need explicit teardown after the workflow ends.
+
+    `ClaudeAgent` lazily initializes its Claude Code CLI subprocess on first
+    `run()` call (via `_ensure_session`). Calling `start()` ourselves from a
+    different asyncio task than the one the workflow uses to drive the agent
+    triggers anyio cancel-scope errors. So we let it self-init, and only
+    handle teardown here.
+    """
+    try:
+        yield
+    finally:
+        for agent in agents.values():
+            stop = getattr(agent, "stop", None)
+            if callable(stop):
+                try:
+                    result = stop()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:  # noqa: BLE001
+                    print(f"⚠ stop({getattr(agent,'name','?')}) raised: {e}")
+
+
 async def main() -> None:
     load_dotenv()
     task = " ".join(sys.argv[1:]).strip() or DEFAULT_TASK
@@ -42,30 +65,46 @@ async def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     trace = out_root / "trace.txt"
 
-    workflow = build_workflow()
+    workflow, agents, routing = build_workflow()
 
     print(f"▶ Task: {task}\n")
-    print(f"▶ Output dir: {out_root}\n")
+    print(f"▶ Output dir: {out_root}")
+    print("▶ Provider routing:")
+    for role, provider in routing.items():
+        print(f"    {role:<18s} → {provider}")
+    print()
 
     final: FinalArtifact | None = None
 
-    stream = await workflow.run(task, stream=True)
-    with trace.open("w") as tf:
-        async for event in stream:
-            line = f"{type(event).__name__}: {getattr(event, 'executor_id', '')}"
-            print(line)
-            tf.write(line + "\n")
-            payload = getattr(event, "data", None)
-            if isinstance(payload, FinalArtifact):
-                final = payload
+    async with agent_lifecycle(agents):
+        stream = await workflow.run(task, stream=True)
+        with trace.open("w") as tf:
+            async for event in stream:
+                kind = type(event).__name__
+                exec_id = getattr(event, "executor_id", "")
+                # Only treat as error if the attribute is actually set data,
+                # not the inherited WorkflowEvent.error class method.
+                err_attr = event.__dict__.get("error") or event.__dict__.get("exception")
+                if err_attr is not None:
+                    line = f"{kind}: {exec_id}  ERROR={err_attr!r}"
+                    print(f"!! {line}")
+                elif "Failed" in kind or kind.endswith("Error"):
+                    line = f"{kind}: {exec_id}  details={vars(event)!r}"
+                    print(f"!! {line}")
+                else:
+                    line = f"{kind}: {exec_id}"
+                    print(line)
+                tf.write(line + "\n")
+                payload = getattr(event, "data", None)
+                if isinstance(payload, FinalArtifact):
+                    final = payload
 
-    if final is None:
-        # Fallback: scan the final result's outputs
-        result = stream.get_final_response()
-        for out in getattr(result, "outputs", []) or []:
-            if isinstance(out, FinalArtifact):
-                final = out
-                break
+        if final is None:
+            result = stream.get_final_response()
+            for out in getattr(result, "outputs", []) or []:
+                if isinstance(out, FinalArtifact):
+                    final = out
+                    break
 
     if final is None:
         print("\n⚠ No FinalArtifact emitted. See trace.txt.")
@@ -76,6 +115,9 @@ async def main() -> None:
     (out_root / "tests.py").write_text(final.tests + "\n")
     (out_root / "security_report.md").write_text(final.security_report)
     (out_root / "README.md").write_text(final.docs)
+    (out_root / "routing.txt").write_text(
+        "\n".join(f"{r}={p}" for r, p in routing.items()) + "\n"
+    )
 
     print(
         f"\n✓ Done in {final.revisions + 1} implementation pass(es). "

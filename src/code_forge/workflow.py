@@ -353,8 +353,17 @@ class Finalize(Executor):
 # ---------------------------------------------------------------------------
 
 
-def build_workflow() -> Workflow:
-    agents = build_agents()
+def build_workflow() -> tuple[Workflow, dict[str, "BaseAgent"], dict[str, str]]:
+    """Build the workflow.
+
+    Returns ``(workflow, agents, routing)``. The runner needs ``agents`` so
+    it can manage the async lifecycle of provider-backed agents (e.g.
+    ``ClaudeAgent`` requires explicit ``start()``/``stop()``), and
+    ``routing`` so it can print which provider served each role.
+    """
+    from agent_framework import BaseAgent  # noqa: F401  (for the type hint above)
+
+    agents, routing = build_agents()
 
     # Custom executors
     spec_to_request = SpecToRequest(id="spec_to_request")
@@ -416,4 +425,4 @@ def build_workflow() -> Workflow:
     # Loop back: revision_loop → Implementer (creates the cycle)
     builder.add_edge(revision_loop, implementer)
 
-    return builder.build()
+    return builder.build(), agents, routing

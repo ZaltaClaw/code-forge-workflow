@@ -5,6 +5,7 @@ description = "Multi-agent coding pipeline as a Microsoft Agent Framework graph 
 requires-python = ">=3.10"
 dependencies = [
     "agent-framework>=0.0.0a1",
+    "agent-framework-claude>=0.0.0a1",
     "python-dotenv>=1.0",
 ]
 

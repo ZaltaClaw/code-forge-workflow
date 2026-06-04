@@ -73,6 +73,41 @@ cp .env.example .env
 
 python examples/run.py
 # or with a custom task:
+python examples/run.py "build a thread-safe LRU cache"
+```
+
+### Mixed-provider mode (OpenAI + Claude Code)
+
+This project demonstrates Microsoft Agent Framework's
+[Claude Agent SDK integration](https://devblogs.microsoft.com/agent-framework/build-ai-agents-with-claude-agent-sdk-and-microsoft-agent-framework/).
+Different graph nodes can be backed by **different LLM providers** without
+changing the workflow topology — every agent implements the same `BaseAgent`
+interface.
+
+By default the **SecurityReviewer is routed to Claude** (via the local
+`claude` CLI) while the rest run on OpenAI. Claude's audits are noticeably
+sharper at catching real bugs in code review.
+
+```bash
+# Prereq: Claude Code CLI installed and signed-in (https://claude.com/claude-code)
+which claude && claude --version
+
+uv pip install --prerelease=allow agent-framework-claude
+
+# Default — Claude reviews, OpenAI does the rest
+python examples/run.py
+
+# Or override:
+CODE_FORGE_PROVIDERS=all-openai python examples/run.py
+CODE_FORGE_PROVIDERS=all-claude  python examples/run.py
+CODE_FORGE_PROVIDERS="security_reviewer=claude,implementer=claude" python examples/run.py
+```
+
+The runner prints which provider served each role at the top of every run,
+and writes the resolved routing to `runs/<ts>/routing.txt` for the record.
+
+```bash
+# Original demo task (slugifier):
 python examples/run.py "Build a thread-safe LRU cache class with TTL eviction"
 ```
 
