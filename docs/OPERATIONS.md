@@ -2,6 +2,44 @@
 
 > Day-2 stuff. P1 procedures, scaling, rotations, common SRE tasks.
 
+## Prerequisites (one-time, per subscription)
+
+### Anthropic / Claude on Foundry — Marketplace terms acceptance
+
+Claude models are a **Marketplace SaaS offer**. Before `infra/modules/foundry.bicep`
+can deploy the `claude-*` deployments, the offer's terms must be accepted **once
+per subscription**. This is **not** an ARM property and **not** a callable REST
+path — it cannot be automated inside the Bicep deploy (an earlier draft tried a
+`deploymentScripts` curl hack; it was removed because no such stable endpoint
+exists). Attempting to deploy the model before accepting terms fails with a
+`MarketplacePurchaseEligibilityFailed` / `SkuNotAvailable` style error.
+
+Requirements:
+
+- **Subscription type**: Enterprise Agreement or MCA-E (pay-as-you-go/MSDN are
+  not eligible for the Anthropic offer).
+- **Region**: `eastus2` or `swedencentral` only. The infra pins `eastus2`.
+
+Accept the terms once, before the first `az deployment sub create`:
+
+```bash
+# Portal path: Foundry portal → Model catalog → Claude → "Agree & continue"
+#   on the Marketplace terms dialog (per subscription, one time).
+#
+# CLI path (if the offer is surfaced as an Azure Marketplace term):
+az term accept \
+  --publisher anthropic \
+  --product anthropic-claude-foundry \
+  --plan claude          # confirm publisher/product/plan IDs in the portal first
+
+# Verify before deploying:
+az term show --publisher anthropic --product anthropic-claude-foundry --plan claude \
+  --query accepted -o tsv   # → true
+```
+
+> If `az term` does not list the offer for your tenant, use the portal flow —
+> it is the canonical path. Treat this as a hard gate in the deploy runbook.
+
 ## On-call basics
 
 - **Pager**: Code Forge SRE rotation (PagerDuty service `code-forge-prod`).
@@ -41,7 +79,7 @@ curl -H "x-litellm-api-key: $LITELLM_MASTER_KEY" \
 
 1. `kubectl -n platform logs deploy/model-gateway -c gateway --tail=100 | grep refresh-aad`
 2. If "Failed to get token" → ServiceAccount federation broken. `az identity federated-credential list --identity-name codeforge-gateway-mi -g rg-codeforge` and confirm subject = `system:serviceaccount:platform:model-gateway`.
-3. If federation is fine, check the MI has `Azure AI User` on the Foundry resource: `az role assignment list --assignee $GATEWAY_MI_PRINCIPAL_ID --scope $FOUNDRY_RESOURCE_ID`.
+3. If federation is fine, check the MI has `Cognitive Services User` on the Foundry account: `az role assignment list --assignee $GATEWAY_MI_PRINCIPAL_ID --scope $FOUNDRY_RESOURCE_ID`.
 
 ### Foundry 429s climbing
 
