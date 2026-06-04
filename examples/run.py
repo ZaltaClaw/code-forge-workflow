@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import os
 import sys
 from pathlib import Path
 
@@ -65,10 +66,23 @@ async def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     trace = out_root / "trace.txt"
 
-    workflow, agents, routing = build_workflow()
+    # Per-agent sandbox dirs live under each run, so every Claude-backed
+    # role gets a fresh isolated workspace. The agents.py builder creates
+    # one sub-dir per role automatically.
+    sandboxes = out_root / "sandboxes"
+    sandboxes.mkdir(exist_ok=True)
+
+    workflow, agents, routing = build_workflow(sandbox_root=sandboxes)
 
     print(f"▶ Task: {task}\n")
     print(f"▶ Output dir: {out_root}")
+    print(f"▶ Sandbox root: {sandboxes}")
+    foundry = os.getenv("CLAUDE_CODE_USE_FOUNDRY") == "1"
+    print(
+        "▶ Claude backend: "
+        + (f"Microsoft Foundry ({os.getenv('ANTHROPIC_FOUNDRY_RESOURCE','?')})"
+           if foundry else "Anthropic public API")
+    )
     print("▶ Provider routing:")
     for role, provider in routing.items():
         print(f"    {role:<18s} → {provider}")

@@ -106,6 +106,43 @@ CODE_FORGE_PROVIDERS="security_reviewer=claude,implementer=claude" python exampl
 The runner prints which provider served each role at the top of every run,
 and writes the resolved routing to `runs/<ts>/routing.txt` for the record.
 
+### Run Claude through Microsoft Foundry
+
+Instead of hitting Anthropic's public API, you can route every Claude
+invocation through your **Foundry-deployed Claude models** (East US 2 /
+Sweden Central) so inference, billing, and audit logs stay inside your
+Azure tenant.
+
+```bash
+# 1. Deploy claude-sonnet-4-6 / haiku-4-5 / opus-4-6 in your Foundry project
+# 2. Sign in with Entra ID
+az login
+
+# 3. Tell the Claude Code CLI to use Foundry
+export CLAUDE_CODE_USE_FOUNDRY=1
+export ANTHROPIC_FOUNDRY_RESOURCE=<your-foundry-resource-name>
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6
+export CODE_FORGE_CLAUDE_MODEL=claude-sonnet-4-6   # match a deployment name
+
+python examples/run.py
+# ▶ Claude backend: Microsoft Foundry (<your-resource-name>)
+```
+
+The runner prints the active backend at the top of every run so you can
+verify a Foundry-routed run at a glance.
+
+### Per-agent sandboxes
+
+Every Claude-backed agent gets its own isolated working directory under
+`runs/<ts>/sandboxes/<role>/`. The Claude Code CLI's bash sandbox is
+enabled (macOS `sandbox-exec` / Linux `bwrap`) so each agent's `Bash`,
+`Write`, and `Edit` tools can only touch its own scratch dir — two
+agents writing to `./scratch.txt` won't clobber each other, and a
+runaway agent can't reach into your repo. `git` is in the
+`excludedCommands` list so it can still run when needed.
+
 ```bash
 # Original demo task (slugifier):
 python examples/run.py "Build a thread-safe LRU cache class with TTL eviction"
@@ -119,8 +156,11 @@ runs/20260604-103728/
 ├── implementation.py
 ├── tests.py
 ├── security_report.md
-├── README.md         (the agent-written one)
-└── trace.txt         (every WorkflowEvent emitted)
+├── README.md          (the agent-written one)
+├── routing.txt        (which provider served each role)
+├── sandboxes/         (one isolated subdir per Claude agent)
+│   └── securityreviewer/
+└── trace.txt          (every WorkflowEvent emitted)
 ```
 
 ## What it actually does

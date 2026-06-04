@@ -20,6 +20,7 @@ Reference:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from agent_framework import BaseAgent
@@ -112,19 +113,74 @@ def _make_openai_agent(client: Any, name: str, instructions: str) -> BaseAgent:
     return client.as_agent(name=name, instructions=instructions)
 
 
-def _make_claude_agent(name: str, instructions: str) -> BaseAgent:
+def _make_claude_agent(name: str, instructions: str, sandbox_root: Path | None = None) -> BaseAgent:
     """Build a ClaudeAgent backed by the Claude Code CLI / Claude Agent SDK.
 
-    The agent is *not* started here — its async lifecycle (`start`/`stop`)
-    is managed by the workflow runner via `agent_lifecycle()`.
+    Two production-grade behaviours wired here:
+
+    1. **Microsoft Foundry routing.** When ``CLAUDE_CODE_USE_FOUNDRY=1`` is set
+       (with ``ANTHROPIC_FOUNDRY_RESOURCE`` or ``ANTHROPIC_FOUNDRY_BASE_URL``),
+       the underlying ``claude`` CLI subprocess routes inference through your
+       Foundry-deployed Claude models (East US 2 / Sweden Central) instead of
+       Anthropic's public API. The SDK inherits the parent process env, so
+       just exporting these vars before launching the workflow is enough — no
+       code changes needed once that's in your shell. We also forward the
+       three deployment-name vars so the CLI doesn't fall back to public-API
+       defaults.
+    2. **Per-agent sandbox.** Each Claude-backed role gets its own ``cwd``
+       directory plus bash sandboxing (macOS/Linux). Without this, every
+       Claude agent in the graph would share the runner's cwd and could
+       overwrite each other's intermediate files when they invoke ``Write``,
+       ``Edit``, or ``Bash``. With it, the worst a runaway agent can do is
+       trash its own scratch dir.
+
+    The agent is *not* started here — its async lifecycle (``start``/``stop``)
+    is managed by the workflow runner via ``agent_lifecycle()``.
     """
     from agent_framework_claude import ClaudeAgent
 
-    model = os.getenv("CODE_FORGE_CLAUDE_MODEL", "sonnet")
+    # --- Model selection -----------------------------------------------------
+    # When routing through Foundry, the "model" is your Foundry deployment
+    # name (e.g. "claude-sonnet-4-6"). Otherwise it's the SDK shorthand
+    # ("sonnet" / "opus" / "haiku") which the CLI maps to public-API IDs.
+    using_foundry = os.getenv("CLAUDE_CODE_USE_FOUNDRY") == "1"
+    if using_foundry:
+        model = (
+            os.getenv("CODE_FORGE_CLAUDE_MODEL")
+            or os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL")
+            or "claude-sonnet-4-6"
+        )
+    else:
+        model = os.getenv("CODE_FORGE_CLAUDE_MODEL", "sonnet")
+
+    options: dict[str, Any] = {"model": model}
+
+    # --- Per-agent sandbox dir ----------------------------------------------
+    if sandbox_root is not None:
+        agent_dir = sandbox_root / name.lower()
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        options["cwd"] = str(agent_dir)
+
+        # Enable Claude's built-in bash sandbox on macOS / Linux. This boxes
+        # any `Bash` tool calls into a sandbox-exec / bwrap jail so an agent
+        # can't reach outside its cwd or hit the network. `git` is in the
+        # excluded list because the SDK's git helper needs real subprocess
+        # access; everything else stays caged.
+        options["sandbox"] = {
+            "enabled": True,
+            "autoAllowBashIfSandboxed": True,
+            "excludedCommands": ["git"],
+            "allowUnsandboxedCommands": False,
+        }
+        # Permission mode: auto-accept edits inside the agent's own sandbox
+        # (otherwise every Write/Edit prompts for confirmation and the run
+        # blocks indefinitely in headless mode).
+        options["permission_mode"] = "acceptEdits"
+
     return ClaudeAgent(
         name=name,
         instructions=instructions,
-        default_options={"model": model},
+        default_options=options,
     )
 
 
@@ -170,11 +226,13 @@ def _resolve_routing() -> dict[str, str]:
     return routing
 
 
-def build_agents() -> tuple[dict[str, BaseAgent], dict[str, str]]:
+def build_agents(sandbox_root: Path | None = None) -> tuple[dict[str, BaseAgent], dict[str, str]]:
     """Instantiate the five role agents and return (agents, routing).
 
-    The routing dict is returned so the runner can print which provider
-    served each role — useful when verifying mixed-provider runs.
+    When ``sandbox_root`` is provided, every Claude-backed agent gets its own
+    sub-directory (``sandbox_root/<rolename>/``) as its ``cwd``, and bash
+    sandboxing is enabled. This isolates filesystem side-effects per agent
+    so two agents writing to ``./scratch.txt`` won't clobber each other.
     """
     routing = _resolve_routing()
 
@@ -186,7 +244,7 @@ def build_agents() -> tuple[dict[str, BaseAgent], dict[str, str]]:
         provider = routing[role]
         display_name = role.replace("_", " ").title().replace(" ", "")
         if provider == "claude":
-            agents[role] = _make_claude_agent(display_name, instructions)
+            agents[role] = _make_claude_agent(display_name, instructions, sandbox_root=sandbox_root)
         else:
             assert openai_client is not None
             agents[role] = _make_openai_agent(openai_client, display_name, instructions)

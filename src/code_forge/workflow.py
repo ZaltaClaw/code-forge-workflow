@@ -353,17 +353,24 @@ class Finalize(Executor):
 # ---------------------------------------------------------------------------
 
 
-def build_workflow() -> tuple[Workflow, dict[str, "BaseAgent"], dict[str, str]]:
+def build_workflow(
+    sandbox_root: "Path | None" = None,
+) -> tuple[Workflow, dict[str, "BaseAgent"], dict[str, str]]:
     """Build the workflow.
 
     Returns ``(workflow, agents, routing)``. The runner needs ``agents`` so
     it can manage the async lifecycle of provider-backed agents (e.g.
     ``ClaudeAgent`` requires explicit ``start()``/``stop()``), and
     ``routing`` so it can print which provider served each role.
+
+    If ``sandbox_root`` is supplied, each Claude-backed agent gets its own
+    isolated sub-directory under it (one per role) plus bash sandboxing
+    so concurrent file/bash operations can't collide.
     """
     from agent_framework import BaseAgent  # noqa: F401  (for the type hint above)
+    from pathlib import Path  # noqa: F401  (forward-ref above)
 
-    agents, routing = build_agents()
+    agents, routing = build_agents(sandbox_root=sandbox_root)
 
     # Custom executors
     spec_to_request = SpecToRequest(id="spec_to_request")
