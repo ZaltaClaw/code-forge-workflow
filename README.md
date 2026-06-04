@@ -15,6 +15,12 @@ This is not a hello-world chain. It exercises the parts of Agent Framework that 
 
 ## The graph
 
+![Code Forge on Azure — the-clouds](docs/architecture-azure-aks.svg)
+
+> **Azure reference deployment** (`docs/architecture-azure-aks.svg`): the orchestrator and all five agent pods run on **AKS** in subscription **the-clouds**. The SecurityReviewer container talks to **Claude Sonnet 4.6 via Azure AI Foundry**; the rest hit Azure OpenAI. Every agent gets its own sandbox PVC backed by Azure Files, and Key Vault, Container Registry, and Log Analytics handle secrets, image pulls, and per-prompt audit trails. Open `docs/architecture-azure-aks.html` for a framed view.
+
+### Logical workflow
+
 ```
        [user task: str]
               |
