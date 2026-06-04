@@ -1,0 +1,20 @@
+apiVersion: v2
+name: code-forge
+description: |
+  Code Forge — multi-tenant Claude Code on AKS, fronted by Microsoft Foundry.
+  Ships: ephemeral agent-pod warm pool, session-router, LiteLLM model gateway,
+  KEDA HTTP Add-on scaling, NetworkPolicy egress lockdown, workload-identity
+  Foundry auth.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - claude-code
+  - microsoft-foundry
+  - aks
+  - keda
+  - agents
+home: https://github.com/code-forge-workflow
+maintainers:
+  - name: Code Forge
+    email: code-forge@example.com

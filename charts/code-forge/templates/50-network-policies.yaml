@@ -1,0 +1,71 @@
+{{- if .Values.networkPolicies.enabled }}
+---
+# Default-deny ingress + egress for the agent pool.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ .Values.namespaces.agentPool }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# Allow agent → model-gateway (egress) and ingress from session-router.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-pod-allow
+  namespace: {{ .Values.namespaces.agentPool }}
+spec:
+  podSelector:
+    matchLabels: { app: agent-pod }
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Router opens a session via http or kubectl exec; both arrive from session-control.
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ .Values.namespaces.sessionControl }} }
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
+  egress:
+    # Cluster DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Model gateway only — no direct Foundry egress, no public internet.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ .Values.namespaces.platform }} }
+          podSelector:
+            matchLabels: { app: model-gateway }
+      ports:
+        - { protocol: TCP, port: 80 }
+        - { protocol: TCP, port: 4000 }
+---
+# Model gateway can reach Azure Foundry (egress) on 443; ingress from cluster only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-gateway-egress
+  namespace: {{ .Values.namespaces.platform }}
+spec:
+  podSelector:
+    matchLabels: { app: model-gateway }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Foundry + Azure AD STS. Restrict by FQDN at the firewall/private-endpoint layer.
+    - ports:
+        - { protocol: TCP, port: 443 }
+{{- end }}

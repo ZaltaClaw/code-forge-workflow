@@ -1,0 +1,27 @@
+{
+  "name": "Code Forge Agent",
+  "image": "acrtheclouds.azurecr.io/code-forge/agent-pod:1.0.0",
+  "remoteUser": "agent",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+  "containerEnv": {
+    "CLAUDE_CODE_USE_FOUNDRY": "1",
+    "ANTHROPIC_FOUNDRY_RESOURCE": "${localEnv:ANTHROPIC_FOUNDRY_RESOURCE}",
+    "ANTHROPIC_FOUNDRY_BASE_URL":  "${localEnv:ANTHROPIC_FOUNDRY_BASE_URL}",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL":   "claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL":  "claude-haiku-4-5",
+    "ENABLE_PROMPT_CACHING_1H": "1"
+  },
+  "mounts": [
+    "source=claude-code-config-${devcontainerId},target=/workspace/.claude,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": ["anthropic.claude-code"]
+    }
+  },
+  "postCreateCommand": "claude --version"
+}

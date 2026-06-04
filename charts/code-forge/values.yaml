@@ -1,0 +1,184 @@
+# =============================================================================
+# Code Forge — production values
+# Override via -f values-prod.yaml or --set key=value
+# =============================================================================
+
+global:
+  # Azure Container Registry that hosts agent-pod, session-router, model-gateway images.
+  registry: acrtheclouds.azurecr.io
+  # Azure tenant + workload identity client IDs (set per-environment).
+  azureTenantId: ""        # e.g. 72f988bf-86f1-41af-91ab-2d7cd011db47
+  # Microsoft Foundry resource for Claude deployments.
+  foundry:
+    resource: ""           # e.g. codeforge-foundry-westus3
+    # If set, overrides resource-based URL construction.
+    baseUrl: ""            # https://{resource}.services.ai.azure.com/anthropic
+    # Deployment names — must match Azure Foundry deployments (pin model versions!)
+    models:
+      opus:    "claude-opus-4-8"
+      sonnet:  "claude-sonnet-4-6"
+      haiku:   "claude-haiku-4-5"
+
+# -------------------------------------------------------------------------
+# Namespaces & isolation
+# -------------------------------------------------------------------------
+namespaces:
+  sessionControl: session-control
+  agentPool:      agent-pool
+  platform:       platform
+
+# -------------------------------------------------------------------------
+# Agent Pod (Claude Code on Foundry)
+# Ephemeral, stateless. Router patches state=warm→bound on allocation.
+# -------------------------------------------------------------------------
+agentPod:
+  image:
+    repository: code-forge/agent-pod
+    tag: 1.0.0
+    pullPolicy: IfNotPresent
+
+  # Baseline warm pool — KEDA overrides up to maxReplicas under load.
+  replicas: 80
+
+  resources:
+    requests: { cpu: "1500m", memory: "3Gi" }
+    limits:   { cpu: "4000m", memory: "8Gi" }
+
+  # Ephemeral scratch workspace — wiped between sessions.
+  workspace:
+    size: 10Gi
+    storageClass: managed-csi  # azure-disk; swap for managed-csi-premium for IO-bound workloads
+
+  # Idle session scrub (router writes state=cooldown; pod self-deletes after this).
+  idleTimeoutSeconds: 900
+
+  # Spot node affinity — agents are interruptible.
+  nodeSelector:
+    agentpool: spotagents
+  tolerations:
+    - key: kubernetes.azure.com/scalesetpriority
+      operator: Equal
+      value: spot
+      effect: NoSchedule
+
+  # KEDA — Service Bus depth scaling.
+  keda:
+    enabled: true
+    minReplicas: 80
+    maxReplicas: 400
+    pollingIntervalSeconds: 15
+    cooldownPeriodSeconds: 120
+    serviceBus:
+      namespace: ""              # codeforge-bus.servicebus.windows.net
+      queue: agent-pod-claims
+      messageCount: "1"          # pods per queued claim
+      identityClientId: ""       # KEDA workload identity client ID
+
+  # Optional firewall init-container — restricts egress to a curated allow-list.
+  # Kept disabled by default; production deployments rely on Cilium/Calico NetworkPolicies.
+  egressFirewall:
+    enabled: false
+    # Domains Claude Code legitimately reaches; everything else is dropped.
+    allowList:
+      - api.anthropic.com
+      - "*.services.ai.azure.com"   # Foundry
+      - "*.azurecr.io"
+      - registry-1.docker.io
+      - mcr.microsoft.com
+      - github.com
+      - "*.githubusercontent.com"
+      - registry.npmjs.org
+
+# -------------------------------------------------------------------------
+# Session Router
+# Maps (dev_id, project_id) → available pod. Stateless; state in Redis.
+# Scaled by KEDA HTTP Add-on (RPS-based, scale-to-zero off-hours).
+# -------------------------------------------------------------------------
+sessionRouter:
+  image:
+    repository: code-forge/session-router
+    tag: 1.0.0
+    pullPolicy: IfNotPresent
+
+  replicas: 3
+  resources:
+    requests: { cpu: "500m",  memory: "512Mi" }
+    limits:   { cpu: "2000m", memory: "2Gi" }
+
+  service:
+    port: 8080
+
+  redis:
+    # Internal cluster DNS for session state cache.
+    host: redis.platform.svc.cluster.local
+    port: 6379
+
+  cosmosdb:
+    # Long-term session metadata + audit log.
+    endpoint: ""              # https://codeforge.documents.azure.com:443/
+    database: codeforge
+    container: sessions
+
+  keda:
+    enabled: true
+    httpAddon:
+      enabled: true
+      hosts:
+        - api.codeforge.example.com
+      pathPrefixes: [/]
+      targetPendingRequests: 50   # buffer up to 50 in flight before scaling
+      scaledownPeriod: 300
+
+# -------------------------------------------------------------------------
+# Model Gateway (LiteLLM)
+# Single proxy for all Foundry traffic. Per-dev rate limits, cost showback,
+# audit trail, key rotation. Agent pods point ANTHROPIC_FOUNDRY_BASE_URL here.
+# -------------------------------------------------------------------------
+modelGateway:
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: main-stable
+    pullPolicy: IfNotPresent
+
+  replicas: 2
+  resources:
+    requests: { cpu: "500m",  memory: "1Gi" }
+    limits:   { cpu: "2000m", memory: "4Gi" }
+
+  service:
+    port: 80
+    targetPort: 4000
+
+  # Per-tenant budget caps. Agents authenticate via virtual key
+  # which the router mints from Cosmos at session start.
+  budgets:
+    default:
+      maxBudgetUsd: 50
+      tpmLimit: 200000
+      rpmLimit: 200
+
+  # Master key (rotated quarterly). Stored in Key Vault → CSI driver mount.
+  masterKeySecretRef:
+    name: model-gateway-master-key
+    key: master-key
+
+# -------------------------------------------------------------------------
+# Workload identity — federated to Azure AD via OIDC issuer.
+# -------------------------------------------------------------------------
+workloadIdentity:
+  enabled: true
+  agentPod:
+    serviceAccountName: agent-pod
+    clientId: ""             # Foundry caller MI client ID
+  sessionRouter:
+    serviceAccountName: session-router
+    clientId: ""
+  modelGateway:
+    serviceAccountName: model-gateway
+    clientId: ""
+
+# -------------------------------------------------------------------------
+# NetworkPolicy — restrict-by-default egress.
+# -------------------------------------------------------------------------
+networkPolicies:
+  enabled: true

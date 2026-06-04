@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# =============================================================================
+# agent-shutdown — preStop + idle-timeout cleanup.
+# Scrub the workspace so a recycled pod can't leak the previous session's data.
+# =============================================================================
+set -euo pipefail
+
+echo "[agent-shutdown] flushing /workspace and ~/.claude session state"
+
+# Best-effort: terminate any running claude processes.
+pkill -TERM claude 2>/dev/null || true
+sleep 1
+pkill -KILL claude 2>/dev/null || true
+
+# Wipe workspace contents but preserve the mount point + .claude config volume.
+find /workspace -mindepth 1 -maxdepth 1 ! -name '.claude' -exec rm -rf {} + 2>/dev/null || true
+
+# Wipe transient claude session history (token persists in the mounted volume).
+rm -rf /workspace/.claude/sessions/* 2>/dev/null || true
+rm -rf /workspace/.claude/cache/*    2>/dev/null || true
+
+echo "[agent-shutdown] done"

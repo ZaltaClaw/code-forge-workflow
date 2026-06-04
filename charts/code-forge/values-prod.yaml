@@ -1,0 +1,51 @@
+# Production overlay — copy and customize per environment.
+global:
+  registry: acrtheclouds.azurecr.io
+  azureTenantId: ""
+  foundry:
+    resource: codeforge-foundry-westus3
+    models:
+      opus:    claude-opus-4-8
+      sonnet:  claude-sonnet-4-6
+      haiku:   claude-haiku-4-5
+
+agentPod:
+  replicas: 80
+  resources:
+    requests: { cpu: "1500m", memory: "3Gi" }
+    limits:   { cpu: "4000m", memory: "8Gi" }
+  workspace:
+    size: 20Gi
+    storageClass: managed-csi-premium
+  idleTimeoutSeconds: 900
+  keda:
+    enabled: true
+    minReplicas: 80
+    maxReplicas: 400
+    serviceBus:
+      namespace: codeforge-bus.servicebus.windows.net
+      queue: agent-pod-claims
+
+sessionRouter:
+  replicas: 5
+  cosmosdb:
+    endpoint: https://codeforge.documents.azure.com:443/
+  keda:
+    enabled: true
+    httpAddon:
+      enabled: true
+      hosts:
+        - api.codeforge.example.com
+      targetPendingRequests: 50
+      scaledownPeriod: 300
+
+modelGateway:
+  replicas: 4
+  budgets:
+    default:
+      maxBudgetUsd: 50
+      tpmLimit: 200000
+      rpmLimit: 200
+
+networkPolicies:
+  enabled: true

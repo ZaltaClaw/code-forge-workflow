@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# =============================================================================
+# agent-entrypoint — start the agent pod's idle loop + healthz server.
+#
+# The session-router patches our pod label state=warm → state=bound when a dev
+# claims us. While bound, Claude Code is driven via `kubectl exec` from the
+# router (or via an HTTP shim if you prefer). When idle past IDLE_TIMEOUT_SECONDS
+# we flag ourselves cooldown and exit so the kubelet recycles the pod.
+# =============================================================================
+set -euo pipefail
+
+: "${IDLE_TIMEOUT_SECONDS:=900}"
+: "${SESSION_ID:=}"
+: "${POD_NAME:=$(hostname)}"
+
+echo "[agent] booting pod=${POD_NAME} session=${SESSION_ID:-<unbound>} idle_timeout=${IDLE_TIMEOUT_SECONDS}s"
+
+# Background healthz server so the kubelet's probes succeed.
+python3 /usr/local/bin/healthz.py &
+HEALTHZ_PID=$!
+
+# If we have foundry creds we can warm the model cache so the first dev request
+# is fast. This is best-effort — failures are not fatal.
+if [[ -n "${CLAUDE_CODE_USE_FOUNDRY:-}" ]]; then
+  claude --version >/dev/null 2>&1 || true
+fi
+
+LAST_ACTIVITY_FILE=/workspace/.last-activity
+date +%s > "${LAST_ACTIVITY_FILE}"
+
+# Idle watcher.
+while true; do
+  sleep 60
+  if [[ -f "${LAST_ACTIVITY_FILE}" ]]; then
+    NOW=$(date +%s)
+    LAST=$(cat "${LAST_ACTIVITY_FILE}")
+    AGE=$(( NOW - LAST ))
+    if (( AGE > IDLE_TIMEOUT_SECONDS )); then
+      echo "[agent] idle ${AGE}s > ${IDLE_TIMEOUT_SECONDS}s — entering cooldown"
+      /usr/local/bin/agent-shutdown
+      kill "${HEALTHZ_PID}" 2>/dev/null || true
+      exit 0
+    fi
+  fi
+done

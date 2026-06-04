@@ -1,0 +1,12 @@
+{{- range $ns := list .Values.namespaces.sessionControl .Values.namespaces.agentPool .Values.namespaces.platform }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "code-forge.labels" $ | nindent 4 }}
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+{{- end }}

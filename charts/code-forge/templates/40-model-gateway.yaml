@@ -1,0 +1,133 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-gateway-config
+  namespace: {{ .Values.namespaces.platform }}
+data:
+  # LiteLLM proxy config — translates Anthropic Messages API → Foundry Anthropic endpoint.
+  # Per-tenant virtual keys, budget caps, cost showback.
+  config.yaml: |
+    model_list:
+      - model_name: claude-opus
+        litellm_params:
+          model: azure/{{ .Values.global.foundry.models.opus }}
+          api_base: {{ include "code-forge.foundryBaseUrl" . }}
+          api_version: "2024-10-21"
+          # Auth via workload identity DefaultAzureCredential — no static keys.
+          azure_ad_token: "os.environ/AZURE_AD_TOKEN"
+      - model_name: claude-sonnet
+        litellm_params:
+          model: azure/{{ .Values.global.foundry.models.sonnet }}
+          api_base: {{ include "code-forge.foundryBaseUrl" . }}
+          api_version: "2024-10-21"
+          azure_ad_token: "os.environ/AZURE_AD_TOKEN"
+      - model_name: claude-haiku
+        litellm_params:
+          model: azure/{{ .Values.global.foundry.models.haiku }}
+          api_base: {{ include "code-forge.foundryBaseUrl" . }}
+          api_version: "2024-10-21"
+          azure_ad_token: "os.environ/AZURE_AD_TOKEN"
+
+    litellm_settings:
+      drop_params: True
+      set_verbose: False
+      cache: True
+      cache_params:
+        type: redis
+        host: redis.{{ .Values.namespaces.platform }}.svc.cluster.local
+        port: 6379
+
+    general_settings:
+      master_key: "os.environ/LITELLM_MASTER_KEY"
+      database_url: "os.environ/DATABASE_URL"
+      # Show every request in DB so router can build per-dev cost reports.
+      store_model_in_db: True
+      proxy_budget_rescheduler_min_time: 60
+      # Anthropic format pass-through endpoint.
+      pass_through_endpoints:
+        - path: "/anthropic"
+          target: "{{ include "code-forge.foundryBaseUrl" . }}"
+          headers:
+            content-type: "application/json"
+            anthropic-version: "2023-06-01"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-gateway
+  namespace: {{ .Values.namespaces.platform }}
+  labels:
+    app: model-gateway
+    {{- include "code-forge.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.modelGateway.replicas }}
+  selector: { matchLabels: { app: model-gateway } }
+  template:
+    metadata:
+      labels:
+        app: model-gateway
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: {{ .Values.workloadIdentity.modelGateway.serviceAccountName }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          image: {{ .Values.modelGateway.image.repository }}:{{ .Values.modelGateway.image.tag }}
+          imagePullPolicy: {{ .Values.modelGateway.image.pullPolicy }}
+          args: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "4"]
+          ports:
+            - containerPort: 4000
+              name: http
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.modelGateway.masterKeySecretRef.name }}
+                  key: {{ .Values.modelGateway.masterKeySecretRef.key }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: model-gateway-db
+                  key: url
+                  optional: true
+            # Federated workload identity → AAD token for Foundry calls.
+            - name: AZURE_CLIENT_ID
+              value: "{{ .Values.workloadIdentity.modelGateway.clientId }}"
+            - name: AZURE_TENANT_ID
+              value: "{{ .Values.global.azureTenantId }}"
+            # AZURE_FEDERATED_TOKEN_FILE injected by workload-identity webhook.
+            - name: AZURE_AD_TOKEN
+              value: ""   # populated by token sidecar at startup
+          resources:
+            {{- toYaml .Values.modelGateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/litellm
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: 4000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/liveness, port: 4000 }
+            initialDelaySeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: model-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-gateway
+  namespace: {{ .Values.namespaces.platform }}
+spec:
+  selector: { app: model-gateway }
+  ports:
+    - port: {{ .Values.modelGateway.service.port }}
+      targetPort: {{ .Values.modelGateway.service.targetPort }}
+      name: http
