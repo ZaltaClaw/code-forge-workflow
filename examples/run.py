@@ -80,8 +80,11 @@ async def main() -> None:
     foundry = os.getenv("CLAUDE_CODE_USE_FOUNDRY") == "1"
     print(
         "▶ Claude backend: "
-        + (f"Microsoft Foundry ({os.getenv('ANTHROPIC_FOUNDRY_RESOURCE','?')})"
-           if foundry else "Anthropic public API")
+        + (
+            f"Microsoft Foundry ({os.getenv('ANTHROPIC_FOUNDRY_RESOURCE','?')})"
+            if foundry
+            else "Anthropic public API"
+        )
     )
     print("▶ Provider routing:")
     for role, provider in routing.items():
@@ -98,7 +101,9 @@ async def main() -> None:
                 exec_id = getattr(event, "executor_id", "")
                 # Only treat as error if the attribute is actually set data,
                 # not the inherited WorkflowEvent.error class method.
-                err_attr = event.__dict__.get("error") or event.__dict__.get("exception")
+                err_attr = event.__dict__.get("error") or event.__dict__.get(
+                    "exception"
+                )
                 if err_attr is not None:
                     line = f"{kind}: {exec_id}  ERROR={err_attr!r}"
                     print(f"!! {line}")

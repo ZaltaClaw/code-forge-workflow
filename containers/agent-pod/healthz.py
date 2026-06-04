@@ -5,10 +5,16 @@ GET /healthz       → 200 OK if the claude CLI is on PATH
 GET /activity      → POST-only sentinel: bumps /workspace/.last-activity
                     so the idle watcher resets.
 """
+
 from __future__ import annotations
-import http.server, os, shutil, socketserver, time
+import http.server
+import os
+import shutil
+import socketserver
+import time
 
 LAST_ACTIVITY = "/workspace/.last-activity"
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def _ok(self, body=b"ok"):
@@ -34,6 +40,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args, **kwargs):
         pass  # quiet probes
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("HEALTHZ_PORT", "8081"))
