@@ -44,8 +44,8 @@ Demonstrates:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from agent_framework import (
     AgentExecutorRequest,
@@ -61,6 +61,11 @@ from agent_framework import (
 )
 
 from .agents import build_agents
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from agent_framework import BaseAgent
 
 # ---------------------------------------------------------------------------
 # Message types flowing through the graph
@@ -130,9 +135,7 @@ def _strip_code_fence(text: str) -> str:
 
 def _parse_verdict(text: str) -> str:
     """Find VERDICT: APPROVED|CHANGES_REQUESTED in the security report."""
-    m = re.search(
-        r"VERDICT\s*:\s*(APPROVED|CHANGES_REQUESTED)", text, re.IGNORECASE
-    )
+    m = re.search(r"VERDICT\s*:\s*(APPROVED|CHANGES_REQUESTED)", text, re.IGNORECASE)
     return m.group(1).upper() if m else "CHANGES_REQUESTED"
 
 
@@ -192,9 +195,7 @@ class FanoutForReview(Executor):
 
         # One outbound message per branch — fan-out via multiple edges.
         await ctx.send_message(
-            _as_request(
-                "Write pytest tests for the following.\n\n" + package
-            ),
+            _as_request("Write pytest tests for the following.\n\n" + package),
             target_id="test_writer",
         )
         await ctx.send_message(
@@ -206,9 +207,7 @@ class FanoutForReview(Executor):
             target_id="security_reviewer",
         )
         await ctx.send_message(
-            _as_request(
-                "Write a README section for the following.\n\n" + package
-            ),
+            _as_request("Write a README section for the following.\n\n" + package),
             target_id="doc_writer",
         )
 
@@ -367,8 +366,7 @@ def build_workflow(
     isolated sub-directory under it (one per role) plus bash sandboxing
     so concurrent file/bash operations can't collide.
     """
-    from agent_framework import BaseAgent  # noqa: F401  (for the type hint above)
-    from pathlib import Path  # noqa: F401  (forward-ref above)
+    from agent_framework import AgentExecutor
 
     agents, routing = build_agents(sandbox_root=sandbox_root)
 
@@ -383,8 +381,6 @@ def build_workflow(
     finalize = Finalize(id="finalize")
 
     # Wrap agents with stable ids that match the target_ids used in fanout.
-    from agent_framework import AgentExecutor
-
     spec_analyst = AgentExecutor(agents["spec_analyst"], id="spec_analyst")
     implementer = AgentExecutor(agents["implementer"], id="implementer")
     test_writer = AgentExecutor(agents["test_writer"], id="test_writer")
@@ -413,9 +409,7 @@ def build_workflow(
     builder.add_edge(test_writer, tagged_tests)
     builder.add_edge(security_reviewer, tagged_security)
     builder.add_edge(doc_writer, tagged_docs)
-    builder.add_fan_in_edges(
-        [tagged_tests, tagged_security, tagged_docs], aggregator
-    )
+    builder.add_fan_in_edges([tagged_tests, tagged_security, tagged_docs], aggregator)
 
     # Switch-case on verdict + revision count.
     def _changes_and_under_cap(r: AggregatedReview) -> bool:

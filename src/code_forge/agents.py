@@ -113,7 +113,9 @@ def _make_openai_agent(client: Any, name: str, instructions: str) -> BaseAgent:
     return client.as_agent(name=name, instructions=instructions)
 
 
-def _make_claude_agent(name: str, instructions: str, sandbox_root: Path | None = None) -> BaseAgent:
+def _make_claude_agent(
+    name: str, instructions: str, sandbox_root: Path | None = None
+) -> BaseAgent:
     """Build a ClaudeAgent backed by the Claude Code CLI / Claude Agent SDK.
 
     Two production-grade behaviours wired here:
@@ -226,7 +228,9 @@ def _resolve_routing() -> dict[str, str]:
     return routing
 
 
-def build_agents(sandbox_root: Path | None = None) -> tuple[dict[str, BaseAgent], dict[str, str]]:
+def build_agents(
+    sandbox_root: Path | None = None,
+) -> tuple[dict[str, BaseAgent], dict[str, str]]:
     """Instantiate the five role agents and return (agents, routing).
 
     When ``sandbox_root`` is provided, every Claude-backed agent gets its own
@@ -244,7 +248,9 @@ def build_agents(sandbox_root: Path | None = None) -> tuple[dict[str, BaseAgent]
         provider = routing[role]
         display_name = role.replace("_", " ").title().replace(" ", "")
         if provider == "claude":
-            agents[role] = _make_claude_agent(display_name, instructions, sandbox_root=sandbox_root)
+            agents[role] = _make_claude_agent(
+                display_name, instructions, sandbox_root=sandbox_root
+            )
         else:
             assert openai_client is not None
             agents[role] = _make_openai_agent(openai_client, display_name, instructions)
