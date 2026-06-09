@@ -37,9 +37,13 @@ def _env_bool(name: str, default: bool) -> bool:
 VALID_CONNECTION_MODES = {"in-cluster", "local-tunnel", "gateway", "direct"}
 
 # Backends:
-#   sdk  → real k8s-agent-sandbox SandboxClient (requires a cluster + SDK installed)
-#   fake → in-memory simulation (tests, local smoke without a cluster)
-VALID_BACKENDS = {"sdk", "fake"}
+#   direct → create Sandbox CRs directly + drive them via pod exec. Matches the
+#            minimal agent-sandbox controller installed here (only the Sandbox
+#            CRD exists — no SandboxClaim/Template/WarmPool CRDs).
+#   sdk    → upstream k8s-agent-sandbox SandboxClient (needs the claim/template/
+#            warmpool CRDs, which this cluster does NOT have).
+#   fake   → in-memory simulation (tests, local smoke without a cluster).
+VALID_BACKENDS = {"direct", "sdk", "fake"}
 
 
 @dataclass(frozen=True)
@@ -51,12 +55,33 @@ class Config:
     port: int = 8080
 
     # --- Backend selection -----------------------------------------------
-    backend: str = "sdk"
+    backend: str = "direct"
     connection_mode: str = "in-cluster"
+
+    # --- Direct backend: sandbox pod shape -------------------------------
+    # Container image each sandbox pod runs. For real agent work this is the
+    # agent-pod image (ships Claude Code); for smoke tests any shell image works.
+    sandbox_image: str = "mcr.microsoft.com/cbl-mariner/busybox:2.0"
+    # The sandbox namespace enforces PodSecurity "restricted"; pods must run as
+    # a non-root UID. Mirrors the agent-pod's UID 1000.
+    sandbox_run_as_user: int = 1000
+    # Resource envelope stamped onto the sandbox container.
+    sandbox_cpu_request: str = "250m"
+    sandbox_cpu_limit: str = "1000m"
+    sandbox_memory_request: str = "256Mi"
+    sandbox_memory_limit: str = "1Gi"
 
     # --- Sandbox provisioning --------------------------------------------
     # Namespace the SandboxClaim / SandboxWarmPool live in.
     sandbox_namespace: str = "agent-sandboxes"
+    # SandboxTemplate the "sdk" backend builds claims from (and the warm pool
+    # is stamped from). Required by the SDK's create_sandbox(template=...).
+    sandbox_template: str = "python-sandbox-template"
+    # When True, the "direct" backend provisions by creating a SandboxClaim that
+    # adopts a pre-warmed pod from the warm pool (fast, session-style), then
+    # drives it via pod exec. When False it cold-creates a bare Sandbox CR from
+    # the Config pod shape (the original cluster-minimal smoke path).
+    sandbox_use_warmpool: bool = True
     # Default warm pool to claim from when a request doesn't name one.
     default_warmpool: str = "python-sandbox-warmpool"
     # How long to wait for a claimed sandbox to report Ready.
@@ -99,7 +124,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        backend = os.getenv("ORCHESTRATOR_BACKEND", "sdk").strip().lower()
+        backend = os.getenv("ORCHESTRATOR_BACKEND", "direct").strip().lower()
         if backend not in VALID_BACKENDS:
             raise ValueError(
                 f"ORCHESTRATOR_BACKEND must be one of {sorted(VALID_BACKENDS)}, "
@@ -118,7 +143,15 @@ class Config:
             port=_env_int("ORCHESTRATOR_PORT", 8080),
             backend=backend,
             connection_mode=connection_mode,
+            sandbox_image=os.getenv("SANDBOX_IMAGE", "mcr.microsoft.com/cbl-mariner/busybox:2.0"),
+            sandbox_run_as_user=_env_int("SANDBOX_RUN_AS_USER", 1000),
+            sandbox_cpu_request=os.getenv("SANDBOX_CPU_REQUEST", "250m"),
+            sandbox_cpu_limit=os.getenv("SANDBOX_CPU_LIMIT", "1000m"),
+            sandbox_memory_request=os.getenv("SANDBOX_MEMORY_REQUEST", "256Mi"),
+            sandbox_memory_limit=os.getenv("SANDBOX_MEMORY_LIMIT", "1Gi"),
             sandbox_namespace=os.getenv("SANDBOX_NAMESPACE", "agent-sandboxes"),
+            sandbox_template=os.getenv("SANDBOX_TEMPLATE", "python-sandbox-template"),
+            sandbox_use_warmpool=_env_bool("SANDBOX_USE_WARMPOOL", True),
             default_warmpool=os.getenv("SANDBOX_WARMPOOL", "python-sandbox-warmpool"),
             sandbox_ready_timeout=_env_int("SANDBOX_READY_TIMEOUT", 180),
             sandbox_server_port=_env_int("SANDBOX_SERVER_PORT", 8888),

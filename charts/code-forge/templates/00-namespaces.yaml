@@ -1,4 +1,4 @@
-{{- range $ns := list .Values.namespaces.sessionControl .Values.namespaces.agentPool .Values.namespaces.platform }}
+{{- range $ns := list .Values.namespaces.sessionControl .Values.namespaces.platform .Values.sandboxOrchestrator.sandbox.namespace }}
 ---
 apiVersion: v1
 kind: Namespace

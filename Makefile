@@ -2,14 +2,16 @@
 # Code Forge top-level Makefile — image build/push + chart install/template.
 # =============================================================================
 TAG ?= 1.0.0
-ACR ?= acrtheclouds.azurecr.io
+ACR ?= codeforgedemo.azurecr.io
 RELEASE ?= code-forge
 NAMESPACE ?= session-control
+# AKS nodes are linux/amd64; build for that platform even on Apple Silicon.
+PLATFORM ?= linux/amd64
 
 .PHONY: help
 help:
 	@echo "Targets:"
-	@echo "  build-images     # docker build agent-pod + session-router + model-gateway"
+	@echo "  build-images     # docker build agent-pod + sandbox-orchestrator + model-gateway"
 	@echo "  push-images      # docker push to \$$ACR"
 	@echo "  chart-lint       # helm lint"
 	@echo "  chart-template   # helm template (preview rendered yaml)"
@@ -18,16 +20,16 @@ help:
 
 .PHONY: build-images
 build-images:
-	docker build -t $(ACR)/code-forge/agent-pod:$(TAG)      containers/agent-pod
-	docker build -t $(ACR)/code-forge/session-router:$(TAG) containers/session-router
-	docker build -t $(ACR)/code-forge/model-gateway:$(TAG)  containers/model-gateway
+	docker buildx build --platform $(PLATFORM) --load -t $(ACR)/code-forge/agent-pod:$(TAG)            containers/agent-pod
+	docker buildx build --platform $(PLATFORM) --load -t $(ACR)/code-forge/model-gateway:$(TAG)         containers/model-gateway
+	docker buildx build --platform $(PLATFORM) --load -t $(ACR)/code-forge/sandbox-orchestrator:$(TAG)  containers/sandbox-orchestrator
 
 .PHONY: push-images
 push-images:
 	az acr login -n $(firstword $(subst ., ,$(ACR)))
 	docker push $(ACR)/code-forge/agent-pod:$(TAG)
-	docker push $(ACR)/code-forge/session-router:$(TAG)
 	docker push $(ACR)/code-forge/model-gateway:$(TAG)
+	docker push $(ACR)/code-forge/sandbox-orchestrator:$(TAG)
 
 .PHONY: chart-lint
 chart-lint:

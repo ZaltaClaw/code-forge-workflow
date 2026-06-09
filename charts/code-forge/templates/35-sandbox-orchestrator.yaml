@@ -64,8 +64,26 @@ spec:
               value: {{ $so.connectionMode | quote }}
             - name: SANDBOX_NAMESPACE
               value: {{ $so.sandbox.namespace | quote }}
+            - name: SANDBOX_TEMPLATE
+              value: {{ $so.sandbox.templateName | quote }}
+            - name: SANDBOX_USE_WARMPOOL
+              value: {{ $so.sandbox.useWarmpool | quote }}
+            - name: SANDBOX_IMAGE
+              value: {{ $so.sandbox.image | default (printf "%s/%s:%s" .Values.global.registry .Values.agentPod.image.repository .Values.agentPod.image.tag) | quote }}
+            - name: SANDBOX_RUN_AS_USER
+              value: {{ $so.sandbox.runAsUser | quote }}
+            - name: SANDBOX_CPU_REQUEST
+              value: {{ $so.sandbox.resources.requests.cpu | quote }}
+            - name: SANDBOX_CPU_LIMIT
+              value: {{ $so.sandbox.resources.limits.cpu | quote }}
+            - name: SANDBOX_MEMORY_REQUEST
+              value: {{ $so.sandbox.resources.requests.memory | quote }}
+            - name: SANDBOX_MEMORY_LIMIT
+              value: {{ $so.sandbox.resources.limits.memory | quote }}
             - name: SANDBOX_WARMPOOL
               value: {{ $so.sandbox.warmpool | quote }}
+            - name: SANDBOX_READY_TIMEOUT
+              value: {{ $so.sandbox.readyTimeout | quote }}
             - name: SANDBOX_TTL_SECONDS
               value: {{ $so.sandbox.ttlSeconds | quote }}
             - name: SANDBOX_COMMAND_TIMEOUT
@@ -115,19 +133,28 @@ metadata:
   name: sandbox-orchestrator-sandbox-manager
   namespace: {{ $so.sandbox.namespace }}
 rules:
+  # Core CRD (kind Sandbox) lives in agents.x-k8s.io.
   - apiGroups: [{{ $so.sandbox.apiGroup | quote }}]
-    resources: ["sandboxes", "sandboxclaims"]
+    resources: ["sandboxes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [{{ $so.sandbox.apiGroup | quote }}]
+  # Claims/templates/warmpools (the "sdk" backend flow) live in the extensions
+  # group. The orchestrator creates+deletes claims; templates/warmpools are
+  # provisioned by the chart so it only needs to read them.
+  - apiGroups: [{{ $so.sandbox.extensionsApiGroup | quote }}]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [{{ $so.sandbox.extensionsApiGroup | quote }}]
     resources: ["sandboxtemplates", "sandboxwarmpools"]
     verbs: ["get", "list", "watch"]
   # The SDK reads sandbox pod status / streams exec to run commands.
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
+  # The Kubernetes Python client streams exec over a GET (websocket upgrade),
+  # so the orchestrator needs BOTH get and create on pods/exec.
   - apiGroups: [""]
     resources: ["pods/exec", "pods/portforward"]
-    verbs: ["create"]
+    verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

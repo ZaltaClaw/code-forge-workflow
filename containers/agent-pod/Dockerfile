@@ -47,7 +47,9 @@ COPY healthz.py /usr/local/bin/healthz.py
 RUN chmod +x /usr/local/bin/agent-shutdown /usr/local/bin/agent-entrypoint /usr/local/bin/healthz.py
 
 # ---- User & filesystem -------------------------------------------------------
-RUN useradd -m -u 1000 -s /bin/bash agent \
+RUN if ! id -u agent >/dev/null 2>&1; then \
+        useradd -m -s /bin/bash agent; \
+    fi \
  && mkdir -p /workspace /workspace/.claude \
  && chown -R agent:agent /workspace
 

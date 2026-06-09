@@ -135,6 +135,7 @@ class SandboxManager:
             self._set_state(record, RequestState.PROVISIONING)
             labels = self._sandbox_labels(req, record)
             handle = self._backend.create_sandbox(
+                template=self._config.sandbox_template,
                 warmpool=warmpool,
                 labels=labels,
                 ttl_seconds=req.ttl_seconds if req.ttl_seconds is not None

@@ -19,7 +19,9 @@ is exactly the slice of the SDK the orchestrator needs.
 from __future__ import annotations
 
 import abc
+import os
 import shlex
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -51,12 +53,15 @@ class SandboxBackend(abc.ABC):
     def create_sandbox(
         self,
         *,
-        warmpool: str,
+        template: str,
+        warmpool: str | None = None,
         labels: dict[str, str] | None = None,
         ttl_seconds: int | None = None,
     ) -> SandboxHandle:
-        """Claim a sandbox from ``warmpool`` and block until it is Ready.
+        """Provision a sandbox from ``template`` and block until it is Ready.
 
+        When ``warmpool`` is set the claim binds to a pre-warmed sandbox from
+        that pool (fast path); otherwise it cold-creates one from ``template``.
         Raises on timeout or provisioning failure; the caller is responsible
         for marking the request FAILED.
         """
@@ -129,15 +134,21 @@ class SdkSandboxBackend(SandboxBackend):
     def create_sandbox(
         self,
         *,
-        warmpool: str,
+        template: str,
+        warmpool: str | None = None,
         labels: dict[str, str] | None = None,
         ttl_seconds: int | None = None,
     ) -> SandboxHandle:
+        # ``template`` is the SDK's only required arg: the claim sets
+        # ``spec.sandboxTemplateRef.name=template``. ``warmpool`` is optional and
+        # binds the claim to a pre-warmed sandbox from that pool when supplied.
         kwargs: dict = {
-            "warmpool": warmpool,
+            "template": template,
             "namespace": self._config.sandbox_namespace,
             "sandbox_ready_timeout": self._config.sandbox_ready_timeout,
         }
+        if warmpool:
+            kwargs["warmpool"] = warmpool
         if labels:
             kwargs["labels"] = labels
         ttl = ttl_seconds if ttl_seconds is not None else self._config.sandbox_ttl_seconds
@@ -173,6 +184,313 @@ class SdkSandboxBackend(SandboxBackend):
             return
         # SDK terminate() is idempotent and swallows 404s.
         sandbox.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Direct backend — create Sandbox CRs ourselves, drive them via pod exec
+# ---------------------------------------------------------------------------
+
+
+# API coordinates of the agent-sandbox ``Sandbox`` CRD installed on the cluster.
+_SANDBOX_GROUP = "agents.x-k8s.io"
+_SANDBOX_VERSION = "v1alpha1"
+_SANDBOX_PLURAL = "sandboxes"
+_SANDBOX_CONTAINER = "sandbox"
+
+
+class DirectSandboxBackend(SandboxBackend):
+    """Provision sandboxes by writing ``Sandbox`` CRs straight to the cluster.
+
+    The upstream ``SandboxClient`` (see :class:`SdkSandboxBackend`) drives a
+    ``SandboxClaim`` → ``SandboxTemplate`` → ``SandboxWarmPool`` pipeline. This
+    cluster only has the bare ``Sandbox`` CRD installed, so we talk to it
+    directly: create a ``Sandbox`` whose ``spec.podTemplate`` describes the
+    agent container, wait for the controller to flip its ``Ready`` condition,
+    then exec into the resulting pod (which is named after the Sandbox) for
+    file staging and command execution. Teardown deletes the CR; the controller
+    garbage-collects the pod.
+    """
+
+    def __init__(self, config: Config):
+        self._config = config
+        # Imported lazily so the module loads without the k8s client present.
+        from kubernetes import client, config as kconfig
+
+        try:
+            kconfig.load_incluster_config()
+        except kconfig.ConfigException:
+            kconfig.load_kube_config()
+        self._k8s = client
+        self._core = client.CoreV1Api()
+        self._custom = client.CustomObjectsApi()
+        # Lazily-built SDK cluster helper for the warm-pool claim lifecycle.
+        self._claim_helper = None
+
+    # -- provisioning ------------------------------------------------------
+
+    def create_sandbox(
+        self,
+        *,
+        template: str,
+        warmpool: str | None = None,
+        labels: dict[str, str] | None = None,
+        ttl_seconds: int | None = None,
+    ) -> SandboxHandle:
+        # Warm-pool path: create a SandboxClaim that adopts a pre-warmed pod from
+        # the pool (sub-2s, session-style), then drive it via pod exec. Falls
+        # back to cold-creating a bare Sandbox CR when warm pools are disabled.
+        if self._config.sandbox_use_warmpool and template:
+            return self._provision_via_claim(template, warmpool, labels, ttl_seconds)
+        return self._provision_direct_cr(labels)
+
+    def _provision_direct_cr(self, labels: dict[str, str] | None) -> SandboxHandle:
+        name = f"cf-sbx-{uuid.uuid4().hex[:10]}"
+        namespace = self._config.sandbox_namespace
+        manifest = self._build_manifest(name, labels)
+
+        self._custom.create_namespaced_custom_object(
+            group=_SANDBOX_GROUP,
+            version=_SANDBOX_VERSION,
+            namespace=namespace,
+            plural=_SANDBOX_PLURAL,
+            body=manifest,
+        )
+        try:
+            self._wait_ready(name, namespace, self._config.sandbox_ready_timeout)
+        except Exception:
+            # Don't leak an orphaned Sandbox if it never came up.
+            self._delete(name, namespace)
+            raise
+        # The controller names the pod identically to the Sandbox CR.
+        return SandboxHandle(sandbox_id=name, claim_name=name, _native={"name": name, "namespace": namespace})
+
+    def _provision_via_claim(
+        self,
+        template: str,
+        warmpool: str | None,
+        labels: dict[str, str] | None,
+        ttl_seconds: int | None,
+    ) -> SandboxHandle:
+        # Reuse the upstream SDK's cluster helper for the claim lifecycle so we
+        # track exactly the SandboxClaim → Sandbox resolution the controller
+        # implements (incl. warm-pool adoption, where the sandbox name differs
+        # from the claim name). I/O still goes over pod exec, not the SDK's HTTP
+        # transport (the agent-pod image doesn't run the sandbox runtime server).
+        from k8s_agent_sandbox.k8s_helper import K8sHelper
+        from k8s_agent_sandbox.utils import construct_sandbox_claim_lifecycle_spec
+
+        helper = self._claim_helper or K8sHelper()
+        self._claim_helper = helper
+
+        namespace = self._config.sandbox_namespace
+        timeout = self._config.sandbox_ready_timeout
+        claim_name = f"cf-claim-{uuid.uuid4().hex[:10]}"
+
+        ttl = ttl_seconds if ttl_seconds is not None else self._config.sandbox_ttl_seconds
+        lifecycle = (
+            construct_sandbox_claim_lifecycle_spec(int(ttl)) if ttl and ttl > 0 else None
+        )
+
+        helper.create_sandbox_claim(
+            claim_name,
+            template,
+            namespace,
+            labels=labels,
+            lifecycle=lifecycle,
+            warmpool=warmpool,
+        )
+        try:
+            start = time.monotonic()
+            sandbox_name = helper.resolve_sandbox_name(claim_name, namespace, timeout)
+            remaining = max(1, int(timeout - (time.monotonic() - start)))
+            helper.wait_for_sandbox_ready(sandbox_name, namespace, remaining)
+        except Exception:
+            # Deleting the claim returns/recycles any adopted warm sandbox.
+            helper.delete_sandbox_claim(claim_name, namespace)
+            raise
+        # The controller names the pod identically to the resolved Sandbox CR.
+        return SandboxHandle(
+            sandbox_id=sandbox_name,
+            claim_name=claim_name,
+            _native={"name": sandbox_name, "namespace": namespace, "claim": claim_name},
+        )
+
+
+    def _build_manifest(self, name: str, labels: dict[str, str] | None) -> dict:
+        cfg = self._config
+        metadata: dict[str, Any] = {"name": name}
+        if labels:
+            metadata["labels"] = labels
+        # The sandbox namespace enforces PodSecurity "restricted": every pod must
+        # run as non-root, drop all capabilities, forbid privilege escalation,
+        # and set a seccomp profile.
+        pod_security = {
+            "runAsNonRoot": True,
+            "runAsUser": cfg.sandbox_run_as_user,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        }
+        container_security = {
+            "allowPrivilegeEscalation": False,
+            "runAsNonRoot": True,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"},
+        }
+        container = {
+            "name": _SANDBOX_CONTAINER,
+            "image": cfg.sandbox_image,
+            # Keep the container idle; the orchestrator execs work into it.
+            "command": ["/bin/sh", "-c", "sleep infinity"],
+            "securityContext": container_security,
+            "resources": {
+                "requests": {"cpu": cfg.sandbox_cpu_request, "memory": cfg.sandbox_memory_request},
+                "limits": {"cpu": cfg.sandbox_cpu_limit, "memory": cfg.sandbox_memory_limit},
+            },
+        }
+        return {
+            "apiVersion": f"{_SANDBOX_GROUP}/{_SANDBOX_VERSION}",
+            "kind": "Sandbox",
+            "metadata": metadata,
+            "spec": {
+                "podTemplate": {
+                    "spec": {
+                        "securityContext": pod_security,
+                        "containers": [container],
+                    }
+                }
+            },
+        }
+
+    def _wait_ready(self, name: str, namespace: str, timeout: int) -> None:
+        """Block until the Sandbox reports ``Ready=True`` or the timeout lapses."""
+        from kubernetes import watch
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = int(deadline - time.monotonic())
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"sandbox {name!r} did not become ready within {timeout}s"
+                )
+            w = watch.Watch()
+            try:
+                for event in w.stream(
+                    self._custom.list_namespaced_custom_object,
+                    group=_SANDBOX_GROUP,
+                    version=_SANDBOX_VERSION,
+                    namespace=namespace,
+                    plural=_SANDBOX_PLURAL,
+                    field_selector=f"metadata.name={name}",
+                    timeout_seconds=remaining,
+                ):
+                    etype = event.get("type")
+                    if etype == "DELETED":
+                        w.stop()
+                        raise RuntimeError(f"sandbox {name!r} was deleted before ready")
+                    obj = event.get("object") or {}
+                    status = obj.get("status") or {}
+                    for cond in status.get("conditions", []):
+                        if cond.get("type") == "Ready" and cond.get("status") == "True":
+                            w.stop()
+                            return
+            finally:
+                w.stop()
+
+    # -- driving the sandbox ----------------------------------------------
+
+    def write_file(self, handle: SandboxHandle, path: str, content: str) -> None:
+        import base64
+
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        directory = os.path.dirname(path) or "."
+        # base64 in argv avoids any stdin/EOF dance over the exec websocket.
+        script = (
+            f"mkdir -p {shlex.quote(directory)} && "
+            f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}"
+        )
+        result = self._exec(handle, ["/bin/sh", "-c", script], timeout=self._config.command_timeout)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"failed to write {path!r} into sandbox "
+                f"{handle.sandbox_id} (exit {result.exit_code}): {result.stderr.strip()}"
+            )
+
+    def run(self, handle: SandboxHandle, command: str, timeout: int) -> ExecResult:
+        return self._exec(handle, ["/bin/sh", "-c", command], timeout=timeout)
+
+    def terminate(self, handle: SandboxHandle) -> None:
+        native = handle._native
+        if not native:
+            return
+        # Warm-pool sandboxes are owned by their SandboxClaim — deleting the
+        # claim recycles the adopted pod. Direct CRs are deleted outright.
+        claim = native.get("claim")
+        if claim:
+            helper = self._claim_helper
+            if helper is None:
+                from k8s_agent_sandbox.k8s_helper import K8sHelper
+
+                helper = K8sHelper()
+                self._claim_helper = helper
+            try:
+                helper.delete_sandbox_claim(claim, native["namespace"])
+            except self._k8s.exceptions.ApiException as exc:
+                if exc.status != 404:
+                    raise
+            return
+        self._delete(native["name"], native["namespace"])
+
+    # -- internals ---------------------------------------------------------
+
+    def _delete(self, name: str, namespace: str) -> None:
+        try:
+            self._custom.delete_namespaced_custom_object(
+                group=_SANDBOX_GROUP,
+                version=_SANDBOX_VERSION,
+                namespace=namespace,
+                plural=_SANDBOX_PLURAL,
+                name=name,
+            )
+        except self._k8s.exceptions.ApiException as exc:
+            if exc.status != 404:
+                raise
+
+    def _exec(self, handle: SandboxHandle, argv: list[str], *, timeout: int) -> ExecResult:
+        from kubernetes.stream import stream
+
+        native = handle._native
+        resp = stream(
+            self._core.connect_get_namespaced_pod_exec,
+            native["name"],
+            native["namespace"],
+            container=_SANDBOX_CONTAINER,
+            command=argv,
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
+        )
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        deadline = time.monotonic() + timeout
+        try:
+            while resp.is_open():
+                if time.monotonic() > deadline:
+                    resp.close()
+                    raise TimeoutError(f"command timed out after {timeout}s")
+                resp.update(timeout=1)
+                if resp.peek_stdout():
+                    stdout_chunks.append(resp.read_stdout())
+                if resp.peek_stderr():
+                    stderr_chunks.append(resp.read_stderr())
+            rc = resp.returncode
+        finally:
+            resp.close()
+        return ExecResult(
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+            exit_code=int(rc) if rc is not None else 0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +540,12 @@ class FakeSandboxBackend(SandboxBackend):
     def create_sandbox(
         self,
         *,
-        warmpool: str,
+        template: str,
+        warmpool: str | None = None,
         labels: dict[str, str] | None = None,
         ttl_seconds: int | None = None,
     ) -> SandboxHandle:
-        if warmpool in self._fail_warmpools:
+        if warmpool and warmpool in self._fail_warmpools:
             raise RuntimeError(f"warmpool {warmpool!r} has no ready sandboxes")
         sid = f"sbx-{uuid.uuid4().hex[:8]}"
         claim = f"sandbox-claim-{uuid.uuid4().hex[:8]}"
@@ -252,7 +571,9 @@ def build_backend(config: Config) -> SandboxBackend:
     """Factory: pick the backend named by ``config.backend``."""
     if config.backend == "fake":
         return FakeSandboxBackend()
-    return SdkSandboxBackend(config)
+    if config.backend == "sdk":
+        return SdkSandboxBackend(config)
+    return DirectSandboxBackend(config)
 
 
 def derive_command(config: Config, *, task: str, command: str) -> str:
