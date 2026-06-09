@@ -1,7 +1,7 @@
 # Production overlay — copy and customize per environment.
 global:
   registry: codeforgedemo.azurecr.io
-  azureTenantId: "61800350-09d8-4051-942c-5b732fcaa307"
+  azureTenantId: ""
   foundry:
     resource: admin-mgrojh0e-eastus2
     models:
