@@ -1,46 +1,24 @@
 # Production overlay — copy and customize per environment.
 global:
-  registry: acrtheclouds.azurecr.io
+  registry: codeforgedemo.azurecr.io
   azureTenantId: ""
   foundry:
-    resource: codeforge-foundry-westus3
+    resource: admin-mgrojh0e-eastus2
     models:
-      opus:    claude-opus-4-8
-      sonnet:  claude-sonnet-4-6
-      haiku:   claude-haiku-4-5
+      opus: gpt-5.4-mini
+      sonnet: gpt-5-mini
+      haiku: gpt-4o
 
-agentPod:
-  replicas: 80
-  resources:
-    requests: { cpu: "1500m", memory: "3Gi" }
-    limits:   { cpu: "4000m", memory: "8Gi" }
-  workspace:
-    size: 20Gi
-    storageClass: managed-csi-premium
-  idleTimeoutSeconds: 900
-  keda:
-    enabled: true
-    minReplicas: 80
-    maxReplicas: 400
-    serviceBus:
-      namespace: codeforge-bus.servicebus.windows.net
-      queue: agent-pod-claims
-
-sessionRouter:
-  replicas: 5
-  cosmosdb:
-    endpoint: https://codeforge.documents.azure.com:443/
-  keda:
-    enabled: true
-    httpAddon:
-      enabled: true
-      hosts:
-        - api.codeforge.example.com
-      targetPendingRequests: 50
-      scaledownPeriod: 300
-
+sandboxOrchestrator:
+  image:
+    tag: 1.0.2
+  # The "direct" backend now provisions via a SandboxClaim that adopts a
+  # pre-warmed pod from the warm pool (sub-2s allocation) and drives it via pod
+  # exec. We stay on exec rather than the SDK's HTTP transport because the
+  # agent-pod image runs Claude Code, not the agent-sandbox runtime server.
+  backend: direct
 modelGateway:
-  replicas: 4
+  replicas: 1
   budgets:
     default:
       maxBudgetUsd: 50

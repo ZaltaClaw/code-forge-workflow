@@ -8,7 +8,8 @@
 FROM ghcr.io/berriai/litellm:main-stable AS base
 
 USER root
-RUN pip install --no-cache-dir azure-identity msal
+RUN /app/.venv/bin/python -m ensurepip --upgrade \
+ && /app/.venv/bin/python -m pip install --no-cache-dir azure-identity msal
 
 COPY refresh-aad-token.py /usr/local/bin/refresh-aad-token.py
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

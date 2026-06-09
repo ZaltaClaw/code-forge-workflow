@@ -4,32 +4,34 @@
 # =============================================================================
 
 global:
-  # Azure Container Registry that hosts agent-pod, session-router, model-gateway images.
+  # Azure Container Registry that hosts agent-pod, sandbox-orchestrator, model-gateway images.
   registry: acrtheclouds.azurecr.io
   # Azure tenant + workload identity client IDs (set per-environment).
-  azureTenantId: ""        # e.g. 72f988bf-86f1-41af-91ab-2d7cd011db47
+  azureTenantId: "" # e.g. 72f988bf-86f1-41af-91ab-2d7cd011db47
   # Microsoft Foundry resource for Claude deployments.
   foundry:
-    resource: ""           # e.g. codeforge-foundry-westus3
+    resource: "" # e.g. codeforge-foundry-westus3
     # If set, overrides resource-based URL construction.
-    baseUrl: ""            # https://{resource}.services.ai.azure.com/anthropic
+    baseUrl: "" # https://{resource}.services.ai.azure.com/anthropic
     # Deployment names — must match Azure Foundry deployments (pin model versions!)
     models:
-      opus:    "claude-opus-4-8"
-      sonnet:  "claude-sonnet-4-6"
-      haiku:   "claude-haiku-4-5"
+      opus: "claude-opus-4-8"
+      sonnet: "claude-sonnet-4-6"
+      haiku: "claude-haiku-4-5"
 
 # -------------------------------------------------------------------------
 # Namespaces & isolation
 # -------------------------------------------------------------------------
 namespaces:
   sessionControl: session-control
-  agentPool:      agent-pool
-  platform:       platform
+  platform: platform
 
 # -------------------------------------------------------------------------
-# Agent Pod (Claude Code on Foundry)
-# Ephemeral, stateless. Router patches state=warm→bound on allocation.
+# Agent Pod image (Claude Code on Foundry)
+# The agent-pod is no longer deployed as a standalone warm-pool Deployment —
+# the Sandbox Orchestrator's SandboxTemplate / SandboxWarmPool runs this image
+# instead (see sandboxOrchestrator below). Only the image coordinates are kept
+# here because the SandboxTemplate references them.
 # -------------------------------------------------------------------------
 agentPod:
   image:
@@ -37,97 +39,98 @@ agentPod:
     tag: 1.0.0
     pullPolicy: IfNotPresent
 
-  # Baseline warm pool — KEDA overrides up to maxReplicas under load.
-  replicas: 80
-
-  resources:
-    requests: { cpu: "1500m", memory: "3Gi" }
-    limits:   { cpu: "4000m", memory: "8Gi" }
-
-  # Ephemeral scratch workspace — wiped between sessions.
-  workspace:
-    size: 10Gi
-    storageClass: managed-csi  # azure-disk; swap for managed-csi-premium for IO-bound workloads
-
-  # Idle session scrub (router writes state=cooldown; pod self-deletes after this).
-  idleTimeoutSeconds: 900
-
-  # Spot node affinity — agents are interruptible.
-  nodeSelector:
-    agentpool: spotagents
-  tolerations:
-    - key: kubernetes.azure.com/scalesetpriority
-      operator: Equal
-      value: spot
-      effect: NoSchedule
-
-  # KEDA — Service Bus depth scaling.
-  keda:
-    enabled: true
-    minReplicas: 80
-    maxReplicas: 400
-    pollingIntervalSeconds: 15
-    cooldownPeriodSeconds: 120
-    serviceBus:
-      namespace: ""              # codeforge-bus.servicebus.windows.net
-      queue: agent-pod-claims
-      messageCount: "1"          # pods per queued claim
-      identityClientId: ""       # KEDA workload identity client ID
-
-  # Optional firewall init-container — restricts egress to a curated allow-list.
-  # Kept disabled by default; production deployments rely on Cilium/Calico NetworkPolicies.
-  egressFirewall:
-    enabled: false
-    # Domains Claude Code legitimately reaches; everything else is dropped.
-    allowList:
-      - api.anthropic.com
-      - "*.services.ai.azure.com"   # Foundry
-      - "*.azurecr.io"
-      - registry-1.docker.io
-      - mcr.microsoft.com
-      - github.com
-      - "*.githubusercontent.com"
-      - registry.npmjs.org
-
 # -------------------------------------------------------------------------
-# Session Router
-# Maps (dev_id, project_id) → available pod. Stateless; state in Redis.
-# Scaled by KEDA HTTP Add-on (RPS-based, scale-to-zero off-hours).
+# Sandbox Orchestrator
+# Sandbox-native successor to the session-router. Receives a request and
+# provisions ONE agent sandbox per request via the agent-sandbox SDK
+# (create → run → teardown), instead of label-patching a warm pod.
 # -------------------------------------------------------------------------
-sessionRouter:
+sandboxOrchestrator:
   image:
-    repository: code-forge/session-router
+    repository: code-forge/sandbox-orchestrator
     tag: 1.0.0
     pullPolicy: IfNotPresent
 
-  replicas: 3
+  replicas: 2
   resources:
-    requests: { cpu: "500m",  memory: "512Mi" }
-    limits:   { cpu: "2000m", memory: "2Gi" }
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits: { cpu: "1000m", memory: "1Gi" }
 
   service:
     port: 8080
 
-  redis:
-    # Internal cluster DNS for session state cache.
-    host: redis.platform.svc.cluster.local
-    port: 6379
+  # Backend: "direct" (create Sandbox CRs + pod exec; matches the minimal
+  # agent-sandbox controller installed here), "sdk" (upstream claim/template/
+  # warmpool client; needs those CRDs), or "fake" (in-memory; tests only).
+  backend: direct
+  # SDK connection architecture: in-cluster | local-tunnel | gateway | direct.
+  connectionMode: in-cluster
 
-  cosmosdb:
-    # Long-term session metadata + audit log.
-    endpoint: ""              # https://codeforge.documents.azure.com:443/
-    database: codeforge
-    container: sessions
+  sandbox:
+    # Namespace the Sandbox resources live in.
+    namespace: agent-sandboxes
+    # Container image each sandbox pod runs. Defaults to the agent-pod image so
+    # Claude Code is present inside the sandbox. Leave empty to fall back to the
+    # busybox smoke image baked into the orchestrator.
+    image: ""
+    # PodSecurity "restricted" forbids root; run as the sandbox image's own
+    # non-root user. The default agent-pod image creates `agent` as UID 1001
+    # (UID 1000 is the base image's `vscode`) and owns /workspace, so the
+    # sandbox must run as 1001 to have a writable workspace. Keep this in sync
+    # with the SANDBOX_IMAGE's workspace owner.
+    runAsUser: 1001
+    # Resource envelope stamped onto each sandbox container.
+    resources:
+      requests: { cpu: "250m", memory: "256Mi" }
+      limits: { cpu: "1000m", memory: "1Gi" }
+    # Container name inside each sandbox pod. The orchestrator execs into this
+    # container, so it must match what the SandboxTemplate / direct manifest
+    # stamps onto the pod.
+    containerName: sandbox
+    # Provision the SandboxTemplate + SandboxWarmPool from this chart. Requires
+    # the agent-sandbox extensions CRDs (v0.4.6 extensions.yaml) on the cluster.
+    # Set false on minimal clusters running only the "direct" backend.
+    provisionTemplate: true
+    # SandboxTemplate the warm pool (and "sdk" backend claims) are built from.
+    # Provisioned by the chart from the agent-pod image below.
+    templateName: python-sandbox-template
+    # When true, the "direct" backend provisions by claiming a pre-warmed pod
+    # from the warm pool (SandboxClaim adoption) instead of cold-creating a
+    # bare Sandbox CR. Gives sub-2s session-style allocation.
+    useWarmpool: true
+    # Default warm pool a request claims from when it doesn't name one
+    # (used by the "sdk" backend; ignored by "direct").
+    warmpool: python-sandbox-warmpool
+    # Number of pre-warmed sandboxes the controller keeps Ready in the pool.
+    # This is what makes session allocation sub-2s instead of a cold start.
+    warmpoolReplicas: 2
+    # Opt into a headless Service per sandbox (v0.4.6 made this opt-in). The
+    # orchestrator routes via pod exec, so leave off unless you need DNS.
+    service: false
+    # Size limit for the sandbox's writable /workspace emptyDir (Claude Code's
+    # config dir + staged files live here under a read-only root filesystem).
+    workspaceSize: 8Gi
+    # How long to wait for a provisioned sandbox to report Ready.
+    readyTimeout: 180
+    # Controller-side TTL (SandboxClaim shutdownTime). Safety net if we crash.
+    ttlSeconds: 3600
+    # Per-command execution timeout inside the sandbox.
+    commandTimeout: 300
+    # API group of the core agent-sandbox CRD (kind Sandbox). MUST match the
+    # cluster — used to scope the orchestrator's RBAC Role.
+    apiGroup: agents.x-k8s.io
+    # API group of the agent-sandbox *extensions* CRDs (SandboxClaim,
+    # SandboxTemplate, SandboxWarmPool), installed from the v0.4.6
+    # extensions.yaml. Needed by the "sdk" backend's claim/template/warmpool flow.
+    extensionsApiGroup: extensions.agents.x-k8s.io
 
-  keda:
-    enabled: true
-    httpAddon:
-      enabled: true
-      hosts:
-        - api.codeforge.example.com
-      pathPrefixes: [/]
-      targetPendingRequests: 50   # buffer up to 50 in flight before scaling
-      scaledownPeriod: 300
+  # Admission caps — exceeding either returns HTTP 429 (carried from the router).
+  concurrency:
+    maxTotal: 100
+    maxPerDev: 3
+
+  # How a free-text task becomes a sandbox command. {task} is shell-quoted.
+  agentCommandTemplate: "claude -p {task}"
 
 # -------------------------------------------------------------------------
 # Model Gateway (LiteLLM)
@@ -142,8 +145,8 @@ modelGateway:
 
   replicas: 2
   resources:
-    requests: { cpu: "500m",  memory: "1Gi" }
-    limits:   { cpu: "2000m", memory: "4Gi" }
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits: { cpu: "2000m", memory: "4Gi" }
 
   service:
     port: 80
@@ -167,11 +170,8 @@ modelGateway:
 # -------------------------------------------------------------------------
 workloadIdentity:
   enabled: true
-  agentPod:
-    serviceAccountName: agent-pod
-    clientId: ""             # Foundry caller MI client ID
-  sessionRouter:
-    serviceAccountName: session-router
+  sandboxOrchestrator:
+    serviceAccountName: sandbox-orchestrator
     clientId: ""
   modelGateway:
     serviceAccountName: model-gateway

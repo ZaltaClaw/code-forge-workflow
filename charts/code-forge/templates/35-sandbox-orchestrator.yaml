@@ -1,0 +1,199 @@
+---
+# =============================================================================
+# Sandbox Orchestrator — sandbox-native successor to the session-router.
+#
+# Runs in the session-control plane. Instead of label-patching a warm agent pod,
+# it provisions ONE agent sandbox per request via the agent-sandbox SDK
+# (create → run → teardown). Its RBAC therefore targets the agent-sandbox CRDs
+# in the sandbox namespace, NOT raw pods.
+# =============================================================================
+{{- $so := .Values.sandboxOrchestrator }}
+{{- $wi := .Values.workloadIdentity.sandboxOrchestrator }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $wi.serviceAccountName }}
+  namespace: {{ .Values.namespaces.sessionControl }}
+  annotations:
+    azure.workload.identity/client-id: "{{ $wi.clientId }}"
+    azure.workload.identity/tenant-id: "{{ .Values.global.azureTenantId }}"
+  labels:
+    azure.workload.identity/use: "true"
+    {{- include "code-forge.labels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-orchestrator
+  namespace: {{ .Values.namespaces.sessionControl }}
+  labels:
+    app: sandbox-orchestrator
+    {{- include "code-forge.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $so.replicas }}
+  selector: { matchLabels: { app: sandbox-orchestrator } }
+  template:
+    metadata:
+      labels:
+        app: sandbox-orchestrator
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: {{ $wi.serviceAccountName }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: orchestrator
+          image: {{ .Values.global.registry }}/{{ $so.image.repository }}:{{ $so.image.tag }}
+          imagePullPolicy: {{ $so.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ORCHESTRATOR_PORT
+              value: "8080"
+            - name: ORCHESTRATOR_BACKEND
+              value: {{ $so.backend | quote }}
+            - name: SANDBOX_CONNECTION_MODE
+              value: {{ $so.connectionMode | quote }}
+            - name: SANDBOX_NAMESPACE
+              value: {{ $so.sandbox.namespace | quote }}
+            - name: SANDBOX_TEMPLATE
+              value: {{ $so.sandbox.templateName | quote }}
+            - name: SANDBOX_USE_WARMPOOL
+              value: {{ $so.sandbox.useWarmpool | quote }}
+            - name: SANDBOX_IMAGE
+              value: {{ $so.sandbox.image | default (printf "%s/%s:%s" .Values.global.registry .Values.agentPod.image.repository .Values.agentPod.image.tag) | quote }}
+            - name: SANDBOX_RUN_AS_USER
+              value: {{ $so.sandbox.runAsUser | quote }}
+            - name: SANDBOX_CPU_REQUEST
+              value: {{ $so.sandbox.resources.requests.cpu | quote }}
+            - name: SANDBOX_CPU_LIMIT
+              value: {{ $so.sandbox.resources.limits.cpu | quote }}
+            - name: SANDBOX_MEMORY_REQUEST
+              value: {{ $so.sandbox.resources.requests.memory | quote }}
+            - name: SANDBOX_MEMORY_LIMIT
+              value: {{ $so.sandbox.resources.limits.memory | quote }}
+            - name: SANDBOX_WARMPOOL
+              value: {{ $so.sandbox.warmpool | quote }}
+            - name: SANDBOX_READY_TIMEOUT
+              value: {{ $so.sandbox.readyTimeout | quote }}
+            - name: SANDBOX_TTL_SECONDS
+              value: {{ $so.sandbox.ttlSeconds | quote }}
+            - name: SANDBOX_COMMAND_TIMEOUT
+              value: {{ $so.sandbox.commandTimeout | quote }}
+            - name: MAX_CONCURRENT_SANDBOXES
+              value: {{ $so.concurrency.maxTotal | quote }}
+            - name: MAX_CONCURRENT_PER_DEV
+              value: {{ $so.concurrency.maxPerDev | quote }}
+            - name: AGENT_COMMAND_TEMPLATE
+              value: {{ $so.agentCommandTemplate | quote }}
+            - name: MODEL_GATEWAY_URL
+              value: "http://model-gateway.{{ .Values.namespaces.platform }}.svc.cluster.local"
+          resources:
+            {{- toYaml $so.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+          # Orchestrator writes nothing to disk; readOnlyRootFilesystem is safe.
+          # uvicorn/Python only need a writable /tmp if a dep spills — mount one.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-orchestrator
+  namespace: {{ .Values.namespaces.sessionControl }}
+spec:
+  selector: { app: sandbox-orchestrator }
+  ports:
+    - port: {{ $so.service.port }}
+      targetPort: 8080
+      name: http
+---
+# The orchestrator manages agent-sandbox CRDs (claim → run → delete) in the
+# sandbox namespace. Scoped to exactly the verbs the SDK needs — no raw pod
+# patching like the old session-router required.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-orchestrator-sandbox-manager
+  namespace: {{ $so.sandbox.namespace }}
+rules:
+  # Core CRD (kind Sandbox) lives in agents.x-k8s.io.
+  - apiGroups: [{{ $so.sandbox.apiGroup | quote }}]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Claims/templates/warmpools (the "sdk" backend flow) live in the extensions
+  # group. The orchestrator creates+deletes claims; templates/warmpools are
+  # provisioned by the chart so it only needs to read them.
+  - apiGroups: [{{ $so.sandbox.extensionsApiGroup | quote }}]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [{{ $so.sandbox.extensionsApiGroup | quote }}]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "list", "watch"]
+  # The SDK reads sandbox pod status / streams exec to run commands.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # The Kubernetes Python client streams exec over a GET (websocket upgrade),
+  # so the orchestrator needs BOTH get and create on pods/exec.
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/portforward"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-orchestrator-sandbox-manager
+  namespace: {{ $so.sandbox.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $wi.serviceAccountName }}
+    namespace: {{ .Values.namespaces.sessionControl }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-orchestrator-sandbox-manager
+{{- if .Values.networkPolicies.enabled }}
+---
+# Orchestrator egress: cluster DNS + Kubernetes API only. It talks to the
+# kube-apiserver (via the SDK) to drive sandboxes; it does not call Foundry
+# directly (agent work happens inside the sandboxes, behind their own policy).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-orchestrator-egress
+  namespace: {{ .Values.namespaces.sessionControl }}
+spec:
+  podSelector:
+    matchLabels: { app: sandbox-orchestrator }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # kube-apiserver (HTTPS). Restrict to the API server endpoint at the
+    # firewall/private-link layer; NetworkPolicy can't select the API by IP here.
+    - ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 6443 }
+{{- end }}

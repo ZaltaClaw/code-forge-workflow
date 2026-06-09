@@ -8,8 +8,8 @@ targetScope = 'subscription'
 @description('Environment short name (dev/stg/prod)')
 param env string = 'dev'
 
-@description('Azure region')
-param location string = 'westus3'
+@description('Azure region — Claude on Foundry requires eastus2 or swedencentral')
+param location string = 'eastus2'
 
 @description('Project prefix for naming')
 param prefix string = 'codeforge'
@@ -154,9 +154,10 @@ module foundry 'modules/foundry.bicep' = {
     location: location
     tags: tags
     subnetIdPe: network.outputs.peSubnetId
-    keyVaultId: keyvault.outputs.kvId
-    storageId: storage.outputs.storageId
     logAnalyticsWorkspaceId: logging.outputs.workspaceId
+    aksOidcIssuerUrl: aks.outputs.oidcIssuerUrl
+    gatewayIdentityId: identity.outputs.gatewayIdentityId
+    gatewayIdentityPrincipalId: identity.outputs.gatewayIdentityPrincipalId
   }
 }
 

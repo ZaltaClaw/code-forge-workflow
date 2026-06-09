@@ -1,0 +1,14 @@
+# Sandbox Orchestrator — runtime dependencies
+#
+# Pinned to compatible ranges; the agent-sandbox SDK is the only non-obvious one.
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+
+# Upstream agent-sandbox Python client. Provides SandboxClient + connection
+# configs (in-cluster / gateway / local-tunnel / direct). Installed in the
+# image; the test-suite stubs it out via the fake backend so CI needs no cluster.
+k8s-agent-sandbox>=0.1.0
+
+# Kubernetes client. A transitive dep of the SDK, but the "direct" backend uses
+# it directly (create Sandbox CRs + pod exec), so pin it explicitly.
+kubernetes>=29,<37

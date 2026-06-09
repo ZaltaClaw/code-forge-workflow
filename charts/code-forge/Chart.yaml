@@ -2,9 +2,8 @@ apiVersion: v2
 name: code-forge
 description: |
   Code Forge — multi-tenant Claude Code on AKS, fronted by Microsoft Foundry.
-  Ships: ephemeral agent-pod warm pool, session-router, LiteLLM model gateway,
-  KEDA HTTP Add-on scaling, NetworkPolicy egress lockdown, workload-identity
-  Foundry auth.
+  Ships: sandbox-orchestrator with an agent-sandbox warm pool, LiteLLM model
+  gateway, NetworkPolicy egress lockdown, workload-identity Foundry auth.
 type: application
 version: 0.1.0
 appVersion: "1.0.0"

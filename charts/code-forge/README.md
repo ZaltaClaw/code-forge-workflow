@@ -5,10 +5,10 @@ Built around three primitives:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  developer  ──HTTP──▶  session-router  ──k8s patch──▶  pod  │
+│  developer  ──HTTP──▶  sandbox-orchestrator ──claim──▶  pod │
 │                              │                          │   │
 │                              ▼                          ▼   │
-│                          Redis + Cosmos          Claude Code│
+│                       warm pool (CRD)            Claude Code│
 │                                                       │     │
 │                                                       ▼     │
 │                                             model-gateway   │
@@ -18,12 +18,13 @@ Built around three primitives:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-- **Agent pod** — Ubuntu devcontainer image with Claude Code installed via the
-  official `ghcr.io/anthropics/devcontainer-features/claude-code:1.0` Feature.
-  Runs as non-root, ephemeral `/workspace`, idle timeout, label-driven state
-  machine (`warm` → `bound` → `cooldown`).
-- **Session router** — Go service that maps `(dev_id, project_id)` to a free
-  warm pod, mints a per-session virtual key, and patches pod labels.
+- **Agent sandbox** — Ubuntu devcontainer image with Claude Code installed via
+  the official `ghcr.io/anthropics/devcontainer-features/claude-code:1.0`
+  Feature. Runs as non-root with a writable `/workspace` under a read-only root
+  filesystem. Pre-warmed by a `SandboxWarmPool` for sub-2s allocation.
+- **Sandbox orchestrator** — Python service that provisions ONE agent sandbox
+  per request (claim a warm pod → run → teardown) via the agent-sandbox CRDs,
+  driving I/O over the kube-apiserver exec stream.
 - **Model gateway** — LiteLLM proxy in front of Foundry. Translates the
   Anthropic Messages API used by Claude Code, holds an AAD token refreshed
   via Workload Identity, and enforces per-dev budgets / rate limits.
@@ -37,8 +38,8 @@ charts/code-forge/
   templates/
     00-namespaces.yaml          # PSA-restricted namespaces
     05-serviceaccounts.yaml     # workload-identity SAs
-    20-agent-pod.yaml           # warm pool + KEDA service-bus scaler
-    30-session-router.yaml      # router + KEDA HTTP Add-on RPS scaler + RBAC
+    35-sandbox-orchestrator.yaml # orchestrator Deployment + Service + RBAC
+    36-sandbox-template.yaml    # SandboxTemplate + SandboxWarmPool
     40-model-gateway.yaml       # LiteLLM + ConfigMap
     50-network-policies.yaml    # default-deny + tight allow-list
 ```
@@ -53,10 +54,10 @@ containers/
     agent-entrypoint       # idle watchdog + healthz
     agent-shutdown         # preStop scrub
     healthz.py
-  session-router/
-    main.go                # claim/release loop (Go + client-go + Redis)
-    Dockerfile             # distroless multi-stage
-    go.mod
+  sandbox-orchestrator/
+    sandbox_orchestrator/  # FastAPI app + backend adapters
+    Dockerfile
+    pyproject.toml
   model-gateway/
     Dockerfile             # LiteLLM + AAD-token sidecar
     refresh-aad-token.py
@@ -68,16 +69,15 @@ containers/
 ### 0. Prereqs
 
 - AKS cluster with Workload Identity + OIDC issuer enabled.
-- KEDA installed (`keda` namespace) — core scaler + HTTP Add-on.
+- agent-sandbox controller + extensions CRDs (v0.4.6) installed
+  (`SandboxTemplate`, `SandboxWarmPool`, `SandboxClaim`).
 - Azure resources: ACR, Foundry resource with Claude deployments
   (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`),
-  Service Bus namespace + queue `agent-pod-claims`, Cosmos DB
-  `codeforge` / `sessions`, Redis (Azure Cache for Redis or in-cluster),
   one user-assigned managed identity per role:
-  agent-pod, session-router, model-gateway, KEDA.
+  sandbox-orchestrator, model-gateway.
 - Federate each MI to the corresponding K8s ServiceAccount via
   `az identity federated-credential create`.
-- Grant the agent-pod and model-gateway MIs the **Azure AI User** role
+- Grant the model-gateway MI the **Azure AI User** role
   on the Foundry resource (or the custom role from the Foundry docs).
 
 ### 1. Build & push images
@@ -88,12 +88,12 @@ ACR=acrtheclouds.azurecr.io
 
 az acr login -n acrtheclouds
 
-docker build -t $ACR/code-forge/agent-pod:$TAG       containers/agent-pod
-docker build -t $ACR/code-forge/session-router:$TAG  containers/session-router
-docker build -t $ACR/code-forge/model-gateway:$TAG   containers/model-gateway
+docker build -t $ACR/code-forge/agent-pod:$TAG            containers/agent-pod
+docker build -t $ACR/code-forge/sandbox-orchestrator:$TAG containers/sandbox-orchestrator
+docker build -t $ACR/code-forge/model-gateway:$TAG        containers/model-gateway
 
 docker push $ACR/code-forge/agent-pod:$TAG
-docker push $ACR/code-forge/session-router:$TAG
+docker push $ACR/code-forge/sandbox-orchestrator:$TAG
 docker push $ACR/code-forge/model-gateway:$TAG
 ```
 
@@ -105,22 +105,19 @@ helm upgrade --install code-forge charts/code-forge \
   -f charts/code-forge/values-prod.yaml \
   --set global.azureTenantId=$(az account show --query tenantId -o tsv) \
   --set global.foundry.resource=codeforge-foundry-westus3 \
-  --set workloadIdentity.agentPod.clientId=$AGENT_MI_CLIENT_ID \
-  --set workloadIdentity.sessionRouter.clientId=$ROUTER_MI_CLIENT_ID \
-  --set workloadIdentity.modelGateway.clientId=$GATEWAY_MI_CLIENT_ID \
-  --set agentPod.keda.serviceBus.namespace=codeforge-bus.servicebus.windows.net \
-  --set agentPod.keda.serviceBus.identityClientId=$KEDA_MI_CLIENT_ID
+  --set workloadIdentity.sandboxOrchestrator.clientId=$ORCH_MI_CLIENT_ID \
+  --set workloadIdentity.modelGateway.clientId=$GATEWAY_MI_CLIENT_ID
 ```
 
 ### 3. Verify
 
 ```bash
 # Warm pool fully ready?
-kubectl -n agent-pool get pods -l state=warm
+kubectl -n agent-sandboxes get sandboxwarmpool
 
-# Router reachable?
-kubectl -n session-control port-forward svc/session-router 8080:8080
-curl -X POST localhost:8080/sessions -d '{"dev_id":"alice","project_id":"web"}'
+# Orchestrator reachable?
+kubectl -n session-control port-forward svc/sandbox-orchestrator 8080:8080
+curl -X POST localhost:8080/v1/sandboxes -d '{"dev_id":"alice","command":"echo hi"}'
 
 # Model gateway healthy?
 kubectl -n platform port-forward svc/model-gateway 4000:80
@@ -164,5 +161,4 @@ code .   # opens VS Code, Reopen in Container, claude is installed
 - [Claude Code dev container docs](https://code.claude.com/docs/en/devcontainer)
 - [Claude Code on Microsoft Foundry](https://code.claude.com/docs/en/microsoft-foundry)
 - [Claude Code LLM gateway](https://code.claude.com/docs/en/llm-gateway)
-- [KEDA HTTP Add-on](https://kedacore.github.io/http-add-on/)
 - [Azure Workload Identity](https://azure.github.io/azure-workload-identity/docs/)

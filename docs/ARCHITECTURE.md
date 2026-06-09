@@ -23,26 +23,24 @@
                           │  ┌──────────────────────────────┐  │
                           │  │  Namespace: session-control  │  │
                           │  │  ┌───────────────────────┐   │  │
-                          │  │  │ session-router (Go)   │   │  │
-                          │  │  │ HTTPScaledObject (KEDA│   │  │
-                          │  │  │ HTTP Add-on, RPS)     │   │  │
+                          │  │  │ sandbox-orchestrator  │   │  │
+                          │  │  │ (FastAPI, Python)     │   │  │
+                          │  │  │ claims + apiserver exec│  │  │
                           │  │  └────┬────────┬─────────┘   │  │
                           │  └───────│────────│─────────────┘  │
-                          │          │        │ patch labels   │
-                          │   bind   │        │                │
+                          │          │        │ SandboxClaim   │
+                          │   claim  │        │ (adopt warm)   │
                           │          ▼        ▼                │
                           │  ┌──────────────────────────────┐  │
-                          │  │  Namespace: agent-pool       │  │
+                          │  │  Namespace: agent-sandboxes  │  │
                           │  │  PSA: restricted             │  │
+                          │  │  SandboxWarmPool (pre-warmed)│  │
                           │  │  ┌──────┐ ┌──────┐ ┌──────┐  │  │
-                          │  │  │ pod  │ │ pod  │ │ pod  │  │  │
-                          │  │  │ warm │ │bound │ │ warm │  │  │
+                          │  │  │ sbox │ │ sbox │ │ sbox │  │  │
+                          │  │  │ warm │ │ used │ │ warm │  │  │
                           │  │  │claude│ │claude│ │claude│  │  │
                           │  │  └──┬───┘ └──┬───┘ └──┬───┘  │  │
                           │  │     └────────┴────────┘      │  │
-                          │  │           │                  │  │
-                          │  │   ScaledObject (KEDA,        │  │
-                          │  │   Service Bus depth)         │  │
                           │  └───────────│──────────────────┘  │
                           │              │                     │
                           │              ▼ /anthropic           │
@@ -52,11 +50,8 @@
                           │  │  │ model-gateway (LiteLLM)│  │  │
                           │  │  │ + AAD-token sidecar    │  │  │
                           │  │  └─────────┬──────────────┘  │  │
-                          │  │  ┌─────────┴──────┐          │  │
-                          │  │  │ Redis (state)  │          │  │
-                          │  │  └────────────────┘          │  │
-                          │  └─────────────│────────────────┘  │
-                          └────────────────│───────────────────┘
+                          │  └────────────│────────────────┘  │
+                          └───────────────│───────────────────┘
                                            │ HTTPS + AAD bearer
                                            ▼
                           ┌──────────────────────────────────┐
@@ -66,8 +61,9 @@
                           │  - claude-haiku-4-5 deployment    │
                           └──────────────────────────────────┘
 
-   Side services: Cosmos DB (audit), Service Bus (KEDA queue), Key Vault
-   (LiteLLM master key), Azure Files (per-dev workspace PVCs), ACR.
+   Provided by the agent-sandbox controller (agent-sandbox-system namespace):
+   the SandboxClaim / SandboxTemplate / SandboxWarmPool CRDs.
+   Side services: Key Vault (LiteLLM master key), ACR, optional per-dev PVCs.
 ```
 
 ## Request lifecycle in detail
@@ -75,43 +71,35 @@
 ### 1. Claim
 
 ```
-client → POST https://api.codeforge.example.com/sessions
-         { dev_id: "alice", project_id: "checkout-svc" }
+client → POST https://api.codeforge.example.com/v1/sandboxes
+         { dev_id: "alice", command: "…" }   # or a free-text task
 ```
 
-Front Door → router. Router:
+Front Door → orchestrator. The orchestrator:
 
-1. `GET sess:alice:checkout-svc` from Redis.
-2. **Hit** → bump TTL, return `{pod_name, exec_url}`. Done.
-3. **Miss** → check `MAX_CONCURRENT_PER_DEV` (Redis SCard).
-4. **Miss** → `kubectl get pods -n agent-pool -l app=agent-pod,state=warm --limit=10`.
-5. Pick first; **strategic-merge patch** labels: `state=bound, dev-id=alice, session-id=<ulid>, project-id=checkout-svc`.
-6. Bind workspace: patch the pod to mount Azure Files PVC `workspace-alice-checkout-svc`.
-7. Mint a virtual key in LiteLLM: `POST /key/generate` with `models=[claude-opus,…]`, `max_budget=50`, `tpm=200000`, `rpm=200`. LiteLLM returns `sk-…`.
-8. Write that key to a per-pod K8s `Secret` named `agent-virtual-key-<sessid>`; the pod's env reads it via `secretKeyRef` (already wired in `_helpers.tpl`).
-9. `SET sess:alice:checkout-svc {pod_name, …}` with TTL = idle timeout.
-10. `INSERT` audit row into Cosmos.
-11. Return.
+1. Admission-checks `MAX_CONCURRENT_TOTAL` and `MAX_CONCURRENT_PER_DEV`; over either → HTTP 429.
+2. Creates a `SandboxClaim` (`cf-claim-<uuid>`) referencing the configured `SandboxTemplate` + `SandboxWarmPool`, with a controller-side TTL (`shutdownTime` / `shutdownPolicy: Delete`) as a safety net.
+3. The agent-sandbox controller **adopts a pre-warmed pod** from the `SandboxWarmPool` and binds it to the claim (sub-2s). The claim's `status.sandbox.name` carries the adopted sandbox's name (which differs from the claim name).
+4. The orchestrator resolves that sandbox name, waits for Ready (first podIP), and stages any request `files` into `/workspace` via the apiserver exec stream.
+5. It runs the command inside the sandbox over the same exec stream and collects stdout/stderr/exit code.
 
 ### 2. Use
 
-The pod's Claude Code now has a virtual key, hits the in-cluster gateway, which authenticates to Foundry via AAD, gets a streaming completion, decrements the dev's budget in LiteLLM's Postgres, returns to Claude Code.
+Inside the sandbox, Claude Code is configured for Foundry (`CLAUDE_CODE_USE_FOUNDRY=1`, `ANTHROPIC_FOUNDRY_BASE_URL=http://model-gateway.platform.svc.cluster.local/anthropic`, pinned model names). It calls the in-cluster **gateway**, which authenticates to Foundry via a federated AAD token, applies the per-dev budget / RPM caps, forwards the request, and logs cost. The sandbox never sees Foundry or an API key directly.
 
 ### 3. Release
 
-Three triggers:
-
-- **Idle** — pod's `agent-entrypoint` watchdog sees no activity for 15 min → calls `agent-shutdown` → exits → ReplicaSet replaces.
-- **Spot eviction** — Service Bus message published by AKS spot-eviction handler. Router picks it up, marks the session `migrating`, claims a new warm pod, re-mounts the same PVC, transparently resumes (lossy if mid-stream — TODO: resume-on-reconnect via Claude Code session resume).
-- **Explicit logout** — `DELETE /sessions/<id>` from the client. Router patches `state=cooldown`, deletes the K8s secret, evicts from Redis.
+- **Completion** — when the command finishes, the orchestrator deletes the `SandboxClaim`. The warm pool controller self-heals back to its target `readyReplicas`.
+- **TTL** — if the orchestrator crashes mid-request, the claim's `shutdownTime` lets the controller reap the sandbox without manual cleanup.
+- **Pool refresh** — each sandbox is single-use; the read-only root FS + emptyDir `/workspace` mean there is no cross-session residue to scrub.
 
 ## Why these tech choices
 
 | Choice | Why | What we considered |
 |---|---|---|
-| AKS (vs. ACI / Container Apps) | Full PSA, NetworkPolicies, KEDA HTTP Add-on, custom CSI drivers | Container Apps doesn't expose NetworkPolicy; ACI doesn't pool |
-| KEDA HTTP Add-on for the router | Scale-to-zero off-hours, RPS-based, request buffering during cold-start | Plain HPA on CPU lags by minutes |
-| KEDA Service Bus for agent pool | Decouples claim demand from pool size; queue acts as buffer for burst | HPA-on-Redis would work but Service Bus is the standard pattern with auth via MI |
+| AKS (vs. ACI / Container Apps) | Full PSA, NetworkPolicies, custom CSI drivers, and the agent-sandbox CRDs | Container Apps doesn't expose NetworkPolicy; ACI doesn't pool |
+| agent-sandbox `SandboxWarmPool` (vs. a hand-rolled warm Deployment + KEDA) | Pre-warmed pods + claim adoption give sub-2s allocation with a controller that owns lifecycle; no label-patching state machine | A KEDA-scaled Deployment with `state=warm/bound` labels (our original v1 — retired) |
+| apiserver `exec` stream for I/O (vs. an in-pod HTTP server) | The agent-pod image runs Claude Code, not a runtime HTTP server; exec needs no extra surface or NetworkPolicy ingress | The agent-sandbox SDK's HTTP transport — needs a runtime server in the image we don't ship |
 | LiteLLM (vs. APIM / Traefik) | Native LLM features: virtual keys, budgets, prompt-cache routing, model fallback | APIM lacks LLM-native budget; Traefik isn't aware of token semantics |
 | Workload Identity (vs. AAD Pod Identity / static keys) | OIDC-federated, no secret on disk, per-workload MI | Pod Identity is deprecated; static keys are an audit nightmare |
 | Bicep (vs. Terraform) | First-party Azure, `what-if` is excellent, no state file to manage | Terraform if multi-cloud — we're not |
@@ -120,27 +108,27 @@ Three triggers:
 
 ## Capacity model
 
-- **Warm pool baseline**: 80 pods. Each pod = 1 active session.
-- **Burst max**: 400 pods (KEDA `maxReplicas`).
-- **Pod size**: `1.5–4 CPU`, `3–8 GiB`. Spot-priced D8s_v5 ≈ $0.08/hr → ~$58/mo per pod.
-- **Steady-state cost**: 80 pods × $58 + cluster overhead + Foundry tokens. Estimate: $8–12k/mo for ~150 active developers (2–3 sessions per dev per day, 90-min average).
-- **Idle scrub**: 15 min. Tunable via `agentPod.idleTimeoutSeconds`.
+- **Warm pool baseline**: `sandboxOrchestrator.sandbox.warmpoolReplicas` pre-warmed sandboxes kept Ready by the controller. Each adopted sandbox serves one request, then is torn down.
+- **Admission caps**: `concurrency.maxTotal` (cluster-wide) and `concurrency.maxPerDev` bound in-flight sandboxes; exceeding either returns HTTP 429.
+- **Sandbox size**: governed by `sandboxOrchestrator.sandbox.resources` (default `250m–1 CPU`, `256Mi–1Gi`). Tune up for heavier Claude Code workloads.
+- **Scaling knob**: raise `warmpoolReplicas` for deeper burst headroom (more idle pods, faster claims) and `maxTotal` for higher concurrency ceilings.
 
 ## Failure modes & blast radius
 
 | Failure | Blast radius | Mitigation |
 |---|---|---|
-| Router crash | New claims fail until pod restarts (~10s). Existing sessions unaffected (they talk to pods directly) | 3+ replicas behind a Service; KEDA HTTP Add-on absorbs the request burst |
+| Orchestrator crash | New requests fail until the pod restarts (~10s). In-flight sandboxes keep running; their claims are reaped by TTL | 2+ replicas behind a Service; requests are stateless and retryable |
+| agent-sandbox controller down | No new claims can be adopted/provisioned; existing sandboxes unaffected | Controller runs with leader-election; restart is fast and stateless |
 | Gateway crash | All in-flight Claude Code requests fail | 2+ replicas; LiteLLM auto-failover between Foundry deployments |
 | Foundry outage | Same as above | Multi-region Foundry deployment + LiteLLM `fallback_models` config |
-| Redis crash | Session state lost — all dev sessions get a new pod on next message | Azure Cache for Redis with replication; Cosmos as durable backup |
-| Spot eviction storm | Many pods evicted at once → claim queue backs up | KEDA scales pool from on-demand fallback; spot diversification across SKUs |
+| Warm pool exhausted | Claims fall back to a cold provision from the `SandboxTemplate` (slower, still works) | Raise `warmpoolReplicas`; the controller refills the pool continuously |
+| Sandbox pod eviction | One in-flight request fails | Request is retryable; the orchestrator deletes the claim and the pool self-heals |
 | AAD token refresh failure | Gateway returns 401 to all agents | Sidecar logs; if it can't refresh for 50 min, alert fires; gateway keeps retrying |
 
 ## Roadmap
 
-- [ ] **HTTP shim per pod** — replace `kubectl exec` I/O channel with a pod-local HTTP shim + Service Mesh; eliminates API server proxy hops.
-- [ ] **Resume-on-reconnect** — Claude Code's session resume + idempotency tokens so spot eviction is invisible.
+- [ ] **Session affinity / resume** — let a dev reattach to a still-running sandbox for multi-turn work instead of one-shot claims.
+- [ ] **Per-request virtual keys** — have the orchestrator mint a short-lived LiteLLM key per claim for finer-grained budget attribution.
 - [ ] **Multi-region active-active** — pair of clusters in westus3 + eastus2; Front Door routes by latency.
 - [ ] **Confidential Containers** — swap PSA-restricted for AKS Confidential Containers when GA on the SKU we use; isolation upgrade for sensitive customers.
-- [ ] **OpenTelemetry traces** end-to-end with `session_id` and `dev_id` propagated.
+- [ ] **OpenTelemetry traces** end-to-end with `request_id` and `dev_id` propagated.

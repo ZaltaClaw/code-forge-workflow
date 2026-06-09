@@ -1,0 +1,103 @@
+{{- $so := .Values.sandboxOrchestrator }}
+{{- $sandboxImage := $so.sandbox.image | default (printf "%s/%s:%s" .Values.global.registry .Values.agentPod.image.repository .Values.agentPod.image.tag) }}
+# =============================================================================
+# Agent-sandbox extensions resources (require the v0.4.6 extensions.yaml CRDs:
+# SandboxTemplate + SandboxWarmPool in extensions.agents.x-k8s.io).
+#
+#   SandboxTemplate  — the reusable pod shape every agent sandbox is stamped
+#                      from (agent-pod image, PodSecurity "restricted"-clean).
+#   SandboxWarmPool  — keeps N sandboxes pre-Ready so a SandboxClaim binds in
+#                      ~sub-2s instead of cold-starting a pod. This is the
+#                      primitive that turns one-shot runs into warm sessions.
+#
+# Gated on sandboxOrchestrator.sandbox.provisionTemplate so clusters running the
+# minimal "direct" backend (no extensions CRDs) can skip these cleanly.
+# =============================================================================
+{{- if $so.sandbox.provisionTemplate }}
+apiVersion: {{ $so.sandbox.extensionsApiGroup }}/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: {{ $so.sandbox.templateName }}
+  namespace: {{ $so.sandbox.namespace }}
+  labels:
+    app: agent-sandbox
+    {{- include "code-forge.labels" . | nindent 4 }}
+spec:
+  # v0.4.6 made the per-sandbox headless Service opt-in. The orchestrator routes
+  # via pod exec, so default off.
+  service: {{ $so.sandbox.service }}
+  podTemplate:
+    metadata:
+      labels:
+        app: agent-sandbox
+        code-forge.io/pool: {{ $so.sandbox.warmpool }}
+    spec:
+      # The sandbox namespace enforces PodSecurity "restricted": run as non-root,
+      # drop all capabilities, forbid privilege escalation, set a seccomp profile.
+      # fsGroup makes the writable emptyDir volumes group-owned by the agent
+      # user (the agent-pod image's `agent` is uid=gid={{ $so.sandbox.runAsUser }}),
+      # so Claude Code and staged files can write to /workspace, /tmp, and the cache.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ $so.sandbox.runAsUser }}
+        fsGroup: {{ $so.sandbox.runAsUser }}
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: {{ $so.sandbox.containerName }}
+          image: {{ $sandboxImage }}
+          # Keep the container idle; the orchestrator execs work into it. We do
+          # NOT run the agent-pod's `agent-entrypoint` here on purpose — that
+          # script self-terminates after IDLE_TIMEOUT, but warm-pool pods must
+          # stay up until the SandboxWarmPool controller recycles them.
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          env:
+            # Claude Code → in-cluster model gateway (NOT Foundry directly). This
+            # is what makes a claimed sandbox a working agent rather than a bare
+            # idle container.
+            {{- include "code-forge.claudeCodeFoundryEnv" . | nindent 12 }}
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: "metadata.name" } }
+            # Redirect Claude's config to the writable workspace volume so it
+            # works under readOnlyRootFilesystem (mirrors the agent-pod).
+            - name: CLAUDE_CONFIG_DIR
+              value: /workspace/.claude
+          resources:
+            {{- toYaml $so.sandbox.resources | nindent 12 }}
+          # Writable mounts mirror the agent-pod so Claude Code can run with a
+          # read-only root filesystem.
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /home/agent/.cache
+      # emptyDir (not an ephemeral PVC like the agent-pod) keeps warm-pool spin-up
+      # fast and storage-free; sandboxes are short-lived and scrubbed on teardown.
+      volumes:
+        - name: workspace
+          emptyDir: { sizeLimit: {{ $so.sandbox.workspaceSize }} }
+        - name: tmp
+          emptyDir: { sizeLimit: 2Gi }
+        - name: cache
+          emptyDir: { sizeLimit: 4Gi }
+---
+apiVersion: {{ $so.sandbox.extensionsApiGroup }}/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: {{ $so.sandbox.warmpool }}
+  namespace: {{ $so.sandbox.namespace }}
+  labels:
+    app: agent-sandbox
+    {{- include "code-forge.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $so.sandbox.warmpoolReplicas }}
+  sandboxTemplateRef:
+    name: {{ $so.sandbox.templateName }}
+{{- end }}

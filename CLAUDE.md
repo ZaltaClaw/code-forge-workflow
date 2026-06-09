@@ -21,12 +21,12 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 ## The three primitives
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│  developer  ──HTTP──▶  session-router  ──k8s patch──▶  agent pod  │
+┌────────────────────────────────────────────────────────┐
+│  developer  ──HTTP──▶  sandbox-orchestrator ──claim──▶  agent pod │
 │   (laptop / IDE)            │                              │      │
 │                             ▼                              ▼      │
-│                       Redis + Cosmos                 Claude Code  │
-│                       (session state)                      │      │
+│                     SandboxWarmPool (CRD)            Claude Code  │
+│                     (pre-warmed sandboxes)                 │      │
 │                                                            ▼      │
 │                                                    model-gateway  │
 │                                                     (LiteLLM)     │
@@ -39,8 +39,8 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 
 | Primitive | What it is | Where it lives | Why |
 |---|---|---|---|
-| **Agent pod** | Ubuntu devcontainer w/ Claude Code installed via the official `ghcr.io/anthropics/devcontainer-features/claude-code:1.0` Feature | `containers/agent-pod/` + `charts/code-forge/templates/20-agent-pod.yaml` | Stateless, ephemeral, label-driven state machine: `warm → bound → cooldown` |
-| **Session router** | Go service that maps `(dev_id, project_id) → free pod`, mints virtual keys, patches pod labels, scrubs idle | `containers/session-router/` + `charts/code-forge/templates/30-session-router.yaml` | The traffic cop. Stateless; state in Redis + Cosmos. Scales via KEDA HTTP Add-on (RPS) |
+| **Agent sandbox** | Ubuntu devcontainer w/ Claude Code installed via the official `ghcr.io/anthropics/devcontainer-features/claude-code:1.0` Feature | `containers/agent-pod/` (image) + `charts/code-forge/templates/36-sandbox-template.yaml` (`SandboxTemplate`/`SandboxWarmPool`) | Stateless, ephemeral, pre-warmed in a pool; writable `/workspace` under a read-only root filesystem |
+| **Sandbox orchestrator** | Python (FastAPI) service that provisions ONE agent sandbox per request — claims a warm pod, runs the command over the apiserver exec stream, tears it down | `containers/sandbox-orchestrator/` + `charts/code-forge/templates/35-sandbox-orchestrator.yaml` | The traffic cop. Stateless; relies on the agent-sandbox CRDs (`SandboxClaim`/`SandboxTemplate`/`SandboxWarmPool`) |
 | **Model gateway** | LiteLLM proxy that fronts Foundry, holds an AAD token (refreshed via Workload Identity), enforces per-dev budgets | `containers/model-gateway/` + `charts/code-forge/templates/40-model-gateway.yaml` | Single audit/billing chokepoint. Agents never see Foundry directly |
 
 ## Repo map (start here)
@@ -60,8 +60,8 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 │   └── templates/
 │       ├── 00-namespaces.yaml
 │       ├── 05-serviceaccounts.yaml
-│       ├── 20-agent-pod.yaml
-│       ├── 30-session-router.yaml
+│       ├── 35-sandbox-orchestrator.yaml
+│       ├── 36-sandbox-template.yaml
 │       ├── 40-model-gateway.yaml
 │       └── 50-network-policies.yaml
 │
@@ -73,10 +73,11 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 │   │   ├── agent-shutdown
 │   │   ├── healthz.py
 │   │   └── CLAUDE.md
-│   ├── session-router/                ← Go (client-go + Redis)
-│   │   ├── main.go
+│   ├── sandbox-orchestrator/          ← Python (FastAPI + agent-sandbox SDK)
+│   │   ├── sandbox_orchestrator/      ← api, manager, backends, config, models
+│   │   ├── tests/
 │   │   ├── Dockerfile
-│   │   ├── go.mod
+│   │   ├── pyproject.toml
 │   │   └── CLAUDE.md
 │   └── model-gateway/                 ← LiteLLM + AAD-token sidecar
 │       ├── Dockerfile
@@ -90,8 +91,6 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 │   │   …                                servicebus, acr, aks, frontdoor, foundry
 │   └── CLAUDE.md
 │
-├── deploy/                            ← reference loose YAML (pre-Helm)
-│
 └── docs/
     ├── ARCHITECTURE.md                ← deep-dive on every primitive
     ├── ONBOARDING.md                  ← 30-minute new-engineer ramp
@@ -104,21 +103,20 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 ## How a request flows (read this once, it makes everything click)
 
 1. Developer runs `claude` in their IDE (or their CLI hits `https://api.codeforge.example.com`).
-2. A thin client call goes to **session-router** with `{dev_id, project_id}`.
-3. Router looks up Redis: existing warm session? → return pod handle.
-   No session? → list pods labeled `app=agent-pod,state=warm`, pick one, **patch labels** to `state=bound, dev-id=…, session-id=…`, attach the dev's workspace PVC, mint a per-session virtual key in LiteLLM, write session record to Cosmos.
-4. Router returns the pod handle. Client streams I/O via `kubectl exec` (or an HTTP shim) into that pod.
-5. Inside the pod, Claude Code calls the **model-gateway** (env: `ANTHROPIC_FOUNDRY_BASE_URL=http://model-gateway.platform.svc.cluster.local/anthropic`).
+2. A thin client call goes to the **sandbox-orchestrator** with `{dev_id, command}`.
+3. The orchestrator creates a `SandboxClaim` that **adopts a pre-warmed pod** from the `SandboxWarmPool` (sub-2s), instead of cold-starting. No free warm pod? → the claim provisions a fresh sandbox from the `SandboxTemplate`.
+4. The orchestrator streams I/O into the sandbox via the kube-apiserver `exec` stream (the agent-pod image runs Claude Code, not an in-pod HTTP server).
+5. Inside the sandbox, Claude Code calls the **model-gateway** (env: `ANTHROPIC_FOUNDRY_BASE_URL=http://model-gateway.platform.svc.cluster.local/anthropic`).
 6. The gateway authenticates to **Foundry** with a federated AAD token, applies budget/RPM caps, forwards the request, logs cost.
-7. Idle for 15 min → router patches pod `state=cooldown`, the pod's preStop hook scrubs `/workspace`, the ReplicaSet brings up a fresh `state=warm` replacement.
+7. On completion (or TTL), the orchestrator deletes the `SandboxClaim`; the warm pool self-heals back to its target `readyReplicas`.
 
 ## Conventions
 
 - **No static API keys.** Every credential is Azure Workload Identity (federated OIDC). If you're tempted to add `ANTHROPIC_API_KEY` to a secret, stop and read `docs/SECURITY.md`.
 - **Pin model versions explicitly.** Aliases (`opus`, `sonnet`, `haiku`) auto-resolve on Foundry and break when Anthropic releases new models. We pin `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5` in `values.yaml`.
-- **Pods are cattle.** Agent pods MUST be safe to nuke at any time. Anything durable goes in Redis (sessions), Cosmos (audit), or PVCs (per-dev workspaces).
-- **Default-deny networking.** Agent pods can only reach the model-gateway and DNS — no public egress, no direct Foundry calls, no internal lateral movement.
-- **Helm is the source of truth** for what's running. The loose YAML under `deploy/` is reference material; production deploys go through `make chart-install`.
+- **Sandboxes are cattle.** Agent sandboxes MUST be safe to nuke at any time. Anything durable goes in the model-gateway audit log or per-dev PVCs.
+- **Default-deny networking.** Agent sandboxes can only reach the model-gateway and DNS — no public egress, no direct Foundry calls, no internal lateral movement.
+- **Helm is the source of truth** for what's running. Production deploys go through `make chart-install`.
 - **Bicep is the source of truth** for what Azure resources exist.
 
 ## Common tasks
@@ -127,7 +125,7 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 |---|---|
 | Change agent-pod image | `containers/agent-pod/Dockerfile` + bump `agentPod.image.tag` |
 | Add a model | `values.yaml` → `global.foundry.models` + LiteLLM ConfigMap |
-| Tweak warm-pool size | `values.yaml` → `agentPod.replicas` (baseline) and `agentPod.keda.minReplicas/maxReplicas` |
+| Tweak warm-pool size | `values.yaml` → `sandboxOrchestrator.sandbox.warmpoolReplicas` |
 | Add a per-dev budget | `values.yaml` → `modelGateway.budgets` |
 | Add a network egress allow | `templates/50-network-policies.yaml` |
 | Rotate LiteLLM master key | `docs/OPERATIONS.md` → "Key rotation" |
@@ -140,8 +138,8 @@ rate-limits, audit, and a warm pool so cold-start is sub-2-seconds.
 make chart-lint
 make chart-template | head -50
 
-# Compile router
-cd containers/session-router && go build ./...
+# Orchestrator unit tests
+cd containers/sandbox-orchestrator && python -m pytest -q
 
 # Dry-run image build (needs Docker daemon)
 docker build -t code-forge/agent-pod:dev containers/agent-pod
@@ -152,7 +150,6 @@ docker build -t code-forge/agent-pod:dev containers/agent-pod
 - Claude Code dev container: <https://code.claude.com/docs/en/devcontainer>
 - Claude Code on Foundry:    <https://code.claude.com/docs/en/microsoft-foundry>
 - Claude Code LLM gateway:   <https://code.claude.com/docs/en/llm-gateway>
-- KEDA HTTP Add-on:          <https://kedacore.github.io/http-add-on/>
 - Azure Workload Identity:   <https://azure.github.io/azure-workload-identity/docs/>
 
 ## Who runs this

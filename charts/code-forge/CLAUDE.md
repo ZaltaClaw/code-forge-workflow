@@ -5,16 +5,21 @@
 
 ## What this chart deploys
 
-Five logical sections, one template file each, numbered for render order:
+Templates are numbered for render order:
 
 | File | Resources | Purpose |
 |---|---|---|
-| `00-namespaces.yaml` | 3 × `Namespace` (PSA-restricted) | `session-control`, `agent-pool`, `platform`. Each carries `pod-security.kubernetes.io/enforce: restricted` so Pod Security Admission rejects privileged pods at admission time |
-| `05-serviceaccounts.yaml` | 3 × `ServiceAccount` | Federated to Azure user-assigned managed identities via `azure.workload.identity/client-id` annotations. Token volume is auto-projected by the workload-identity webhook |
-| `20-agent-pod.yaml` | `Deployment` + `ResourceQuota` + `ScaledObject` | Warm pool of agent containers. KEDA scales on Service Bus `agent-pod-claims` queue depth |
-| `30-session-router.yaml` | `Deployment` + `Service` + `HTTPScaledObject` + `Role`/`RoleBinding` | Router itself + KEDA HTTP Add-on for RPS-based scaling. Cross-namespace RBAC lets the router patch agent-pool pods |
+| `00-namespaces.yaml` | 3 × `Namespace` (PSA-restricted) | `session-control`, `platform`, `agent-sandboxes`. Each carries `pod-security.kubernetes.io/enforce: restricted` so Pod Security Admission rejects privileged pods at admission time |
+| `05-serviceaccounts.yaml` | `ServiceAccount` | model-gateway SA, federated to an Azure user-assigned managed identity via `azure.workload.identity/client-id`. (The orchestrator SA is created in `35-…`.) |
+| `35-sandbox-orchestrator.yaml` | `ServiceAccount` + `Deployment` + `Service` + `Role`/`RoleBinding` | The orchestrator. Provisions ONE agent sandbox per request (claim → run → teardown). RBAC targets the agent-sandbox CRDs + pods/exec in the sandbox namespace |
+| `36-sandbox-template.yaml` | `SandboxTemplate` + `SandboxWarmPool` | The warm pool. Stamps the agent-pod image into pre-warmed sandboxes (Foundry env, writable workspace, PSA-clean). Sub-2s allocation via claim adoption |
 | `40-model-gateway.yaml` | `Deployment` + `Service` + `ConfigMap` | LiteLLM proxy + its `config.yaml` (model list, budgets, pass-through `/anthropic` endpoint) |
-| `50-network-policies.yaml` | 3 × `NetworkPolicy` | Default-deny everywhere; agent pods can ONLY reach `model-gateway` + DNS; gateway can reach Foundry on 443 |
+| `50-network-policies.yaml` | `NetworkPolicy` | Sandboxes can ONLY reach `model-gateway` + DNS; gateway can reach Foundry on 443 |
+
+> The legacy `20-agent-pod.yaml` (warm-pool Deployment + KEDA) and
+> `30-session-router.yaml` were removed when the chart fully migrated to the
+> Sandbox Orchestrator. The agent-pod **image** lives on — it's what the
+> `SandboxTemplate` runs.
 
 ## Values you'll touch most
 
@@ -27,14 +32,14 @@ global:
       sonnet:  claude-sonnet-4-6
       haiku:   claude-haiku-4-5
 
-agentPod:
-  replicas: 80                            # warm-pool baseline (ignored if KEDA min > this)
-  keda:
-    minReplicas: 80
-    maxReplicas: 400
-
-sessionRouter:
-  keda.httpAddon.targetPendingRequests: 50
+sandboxOrchestrator:
+  backend: direct                         # direct | sdk | fake
+  sandbox:
+    warmpoolReplicas: 2                   # pre-warmed sandboxes kept Ready
+    useWarmpool: true                     # claim-adopt a warm pod (sub-2s)
+  concurrency:
+    maxTotal: 100
+    maxPerDev: 3
 
 modelGateway:
   budgets.default.maxBudgetUsd: 50
@@ -53,14 +58,13 @@ modelGateway:
 ```bash
 # Dry-run with synthetic IDs
 make chart-template | yq 'select(.kind=="Deployment") | .metadata.name'
-# → agent-pod, session-router, model-gateway
+# → sandbox-orchestrator, model-gateway
 
 # Full render to a file for inspection
 helm template demo charts/code-forge \
   -f charts/code-forge/values-prod.yaml \
   --set global.azureTenantId=$(uuidgen) \
-  --set workloadIdentity.agentPod.clientId=$(uuidgen) \
-  --set workloadIdentity.sessionRouter.clientId=$(uuidgen) \
+  --set workloadIdentity.sandboxOrchestrator.clientId=$(uuidgen) \
   --set workloadIdentity.modelGateway.clientId=$(uuidgen) \
   > /tmp/render.yaml
 ```
@@ -72,15 +76,18 @@ helm upgrade --install code-forge charts/code-forge \
   --create-namespace -n session-control \
   -f charts/code-forge/values-prod.yaml \
   --set global.azureTenantId=$AZ_TENANT \
-  --set workloadIdentity.agentPod.clientId=$AGENT_MI \
-  --set workloadIdentity.sessionRouter.clientId=$ROUTER_MI \
-  --set workloadIdentity.modelGateway.clientId=$GATEWAY_MI \
-  --set agentPod.keda.serviceBus.namespace=$SB_NAMESPACE
+  --set workloadIdentity.sandboxOrchestrator.clientId=$ORCH_MI \
+  --set workloadIdentity.modelGateway.clientId=$GATEWAY_MI
 ```
 
 ## Common pitfalls
 
-- **`HTTPScaledObject` not found** → install KEDA HTTP Add-on first: `helm install http-add-on kedacore/keda-add-ons-http -n keda`.
-- **`ScaledObject` Service Bus auth failing** → make sure `keda-azure-identity` `TriggerAuthentication` exists and KEDA's MI has `Azure Service Bus Data Owner` on the queue.
-- **Agent pods stuck `Pending`** → spot capacity exhausted. Check `kubectl describe pod` for the `FailedScheduling` event; bump on-demand fallback in the AKS node-pool spec.
-- **Model gateway 401 to Foundry** → `refresh-aad-token.py` failed; check the gateway pod logs for the `[refresh-aad]` line. Usually a missing federation between the gateway MI and its ServiceAccount.
+- **SandboxTemplate/WarmPool CRDs not found** → install the agent-sandbox
+  extensions (v0.4.6 `extensions.yaml`) first, or set
+  `sandboxOrchestrator.sandbox.provisionTemplate=false` on a minimal cluster.
+- **Updating the SandboxTemplate doesn't refresh live warm pods** → delete the
+  warm Sandbox CRs by name (`kubectl delete sandbox -n agent-sandboxes <names>`)
+  to force the pool to re-stamp from the new template.
+- **Model gateway 401 to Foundry** → `refresh-aad-token.py` failed; check the
+  gateway pod logs for the `[refresh-aad]` line. Usually a missing federation
+  between the gateway MI and its ServiceAccount.
