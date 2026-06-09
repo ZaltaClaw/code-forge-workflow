@@ -1,0 +1,9 @@
+# Local dev / image hygiene
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+tests/
+requirements-dev.txt
+.gitignore

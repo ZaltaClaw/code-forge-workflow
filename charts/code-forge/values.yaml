@@ -130,6 +130,52 @@ sessionRouter:
       scaledownPeriod: 300
 
 # -------------------------------------------------------------------------
+# Sandbox Orchestrator
+# Sandbox-native successor to the session-router. Receives a request and
+# provisions ONE agent sandbox per request via the agent-sandbox SDK
+# (create → run → teardown), instead of label-patching a warm pod.
+# -------------------------------------------------------------------------
+sandboxOrchestrator:
+  image:
+    repository: code-forge/sandbox-orchestrator
+    tag: 0.1.0
+    pullPolicy: IfNotPresent
+
+  replicas: 2
+  resources:
+    requests: { cpu: "250m",  memory: "256Mi" }
+    limits:   { cpu: "1000m", memory: "1Gi" }
+
+  service:
+    port: 8080
+
+  # Backend: "sdk" (real agent-sandbox client) or "fake" (in-memory; tests only).
+  backend: sdk
+  # SDK connection architecture: in-cluster | local-tunnel | gateway | direct.
+  connectionMode: in-cluster
+
+  sandbox:
+    # Namespace the Sandbox/SandboxClaim/SandboxWarmPool resources live in.
+    namespace: agent-sandboxes
+    # Default warm pool a request claims from when it doesn't name one.
+    warmpool: python-sandbox-warmpool
+    # Controller-side TTL (SandboxClaim shutdownTime). Safety net if we crash.
+    ttlSeconds: 3600
+    # Per-command execution timeout inside the sandbox.
+    commandTimeout: 300
+    # API group of the installed agent-sandbox CRDs. MUST match the CRDs on the
+    # cluster — used to scope the orchestrator's RBAC Role.
+    apiGroup: agents.x-k8s.io
+
+  # Admission caps — exceeding either returns HTTP 429 (carried from the router).
+  concurrency:
+    maxTotal: 100
+    maxPerDev: 3
+
+  # How a free-text task becomes a sandbox command. {task} is shell-quoted.
+  agentCommandTemplate: "claude -p {task}"
+
+# -------------------------------------------------------------------------
 # Model Gateway (LiteLLM)
 # Single proxy for all Foundry traffic. Per-dev rate limits, cost showback,
 # audit trail, key rotation. Agent pods point ANTHROPIC_FOUNDRY_BASE_URL here.
@@ -172,6 +218,9 @@ workloadIdentity:
     clientId: ""             # Foundry caller MI client ID
   sessionRouter:
     serviceAccountName: session-router
+    clientId: ""
+  sandboxOrchestrator:
+    serviceAccountName: sandbox-orchestrator
     clientId: ""
   modelGateway:
     serviceAccountName: model-gateway
