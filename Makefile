@@ -12,6 +12,18 @@ PLATFORM ?= linux/amd64
 AGENT_SANDBOX_VERSION ?= v0.4.6
 AGENT_SANDBOX_BASE ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)
 
+# Placeholder values used only for `helm lint` / `helm template` previews.
+FOUNDRY_RESOURCE ?= demo
+AZURE_TENANT_ID ?= 00000000-0000-0000-0000-000000000000
+ORCHESTRATOR_CLIENT_ID ?= 11111111-1111-1111-1111-111111111111
+GATEWAY_CLIENT_ID ?= 33333333-3333-3333-3333-333333333333
+# Shared --set flags for the lint/template demo render.
+DEMO_SET = \
+	  --set global.foundry.resource=$(FOUNDRY_RESOURCE) \
+	  --set global.azureTenantId=$(AZURE_TENANT_ID) \
+	  --set workloadIdentity.sandboxOrchestrator.clientId=$(ORCHESTRATOR_CLIENT_ID) \
+	  --set workloadIdentity.modelGateway.clientId=$(GATEWAY_CLIENT_ID)
+
 .PHONY: help
 help:
 	@echo "Targets:"
@@ -38,23 +50,11 @@ push-images:
 
 .PHONY: chart-lint
 chart-lint:
-	helm lint charts/code-forge \
-	  --set global.foundry.resource=demo \
-	  --set global.azureTenantId=00000000-0000-0000-0000-000000000000 \
-	  --set workloadIdentity.agentPod.clientId=11111111-1111-1111-1111-111111111111 \
-	  --set workloadIdentity.sessionRouter.clientId=22222222-2222-2222-2222-222222222222 \
-	  --set workloadIdentity.modelGateway.clientId=33333333-3333-3333-3333-333333333333 \
-	  --set agentPod.keda.serviceBus.namespace=demo.servicebus.windows.net
+	helm lint charts/code-forge $(DEMO_SET)
 
 .PHONY: chart-template
 chart-template:
-	@helm template $(RELEASE) charts/code-forge \
-	  --set global.foundry.resource=demo \
-	  --set global.azureTenantId=00000000-0000-0000-0000-000000000000 \
-	  --set workloadIdentity.agentPod.clientId=11111111-1111-1111-1111-111111111111 \
-	  --set workloadIdentity.sessionRouter.clientId=22222222-2222-2222-2222-222222222222 \
-	  --set workloadIdentity.modelGateway.clientId=33333333-3333-3333-3333-333333333333 \
-	  --set agentPod.keda.serviceBus.namespace=demo.servicebus.windows.net
+	@helm template $(RELEASE) charts/code-forge $(DEMO_SET)
 
 .PHONY: install-crds
 install-crds:
