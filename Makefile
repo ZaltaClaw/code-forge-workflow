@@ -7,6 +7,10 @@ RELEASE ?= code-forge
 NAMESPACE ?= session-control
 # AKS nodes are linux/amd64; build for that platform even on Apple Silicon.
 PLATFORM ?= linux/amd64
+# agent-sandbox controller + CRDs (core Sandbox + extensions: SandboxTemplate/
+# SandboxWarmPool/SandboxClaim). https://github.com/kubernetes-sigs/agent-sandbox
+AGENT_SANDBOX_VERSION ?= v0.4.6
+AGENT_SANDBOX_BASE ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)
 
 .PHONY: help
 help:
@@ -15,7 +19,8 @@ help:
 	@echo "  push-images      # docker push to \$$ACR"
 	@echo "  chart-lint       # helm lint"
 	@echo "  chart-template   # helm template (preview rendered yaml)"
-	@echo "  chart-install    # helm upgrade --install"
+	@echo "  install-crds     # kubectl apply agent-sandbox CRDs + controller"
+	@echo "  chart-install    # install-crds then helm upgrade --install"
 	@echo "  chart-uninstall  # helm uninstall"
 
 .PHONY: build-images
@@ -51,8 +56,14 @@ chart-template:
 	  --set workloadIdentity.modelGateway.clientId=33333333-3333-3333-3333-333333333333 \
 	  --set agentPod.keda.serviceBus.namespace=demo.servicebus.windows.net
 
+.PHONY: install-crds
+install-crds:
+	kubectl apply --server-side -f $(AGENT_SANDBOX_BASE)/manifest.yaml
+	kubectl apply --server-side -f $(AGENT_SANDBOX_BASE)/extensions.yaml
+	kubectl -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
+
 .PHONY: chart-install
-chart-install:
+chart-install: install-crds
 	helm upgrade --install $(RELEASE) charts/code-forge \
 	  --create-namespace --namespace $(NAMESPACE) \
 	  -f charts/code-forge/values-prod.yaml
