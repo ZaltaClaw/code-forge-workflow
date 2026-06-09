@@ -44,7 +44,7 @@ az term show --publisher anthropic --product anthropic-claude-foundry --plan cla
 
 - **Pager**: Code Forge SRE rotation (PagerDuty service `code-forge-prod`).
 - **Sev mapping**:
-  - **Sev1**: > 25% of devs can't claim a session, OR Foundry budget exceeded by 50% in 1h, OR data exfiltration suspected.
+  - **Sev1**: > 25% of devs can't get a sandbox, OR Foundry budget exceeded by 50% in 1h, OR data exfiltration suspected.
   - **Sev2**: Single-digit-percent error rate, single component down with redundancy intact.
   - **Sev3**: Cosmetic, no user impact.
 
@@ -57,8 +57,9 @@ kubectl top nodes
 kubectl get events -A --sort-by='.lastTimestamp' | tail -50
 
 # Code Forge specifics
-kubectl -n session-control logs deploy/session-router --tail=200
-kubectl -n agent-pool get pods -l app=agent-pod -L state -L dev-id
+kubectl -n session-control logs deploy/sandbox-orchestrator --tail=200
+kubectl -n agent-sandboxes get sandboxwarmpool,sandboxes,sandboxclaims
+kubectl -n agent-sandbox-system logs deploy/agent-sandbox-controller --tail=100
 kubectl -n platform logs deploy/model-gateway --tail=200 | grep -E '(refresh-aad|ERROR|429|401)'
 
 # Foundry budget
@@ -68,12 +69,13 @@ curl -H "x-litellm-api-key: $LITELLM_MASTER_KEY" \
 
 ## Common P1 patterns
 
-### Devs can't claim sessions
+### Devs can't get a sandbox
 
-1. Check session-router pod status. `CrashLoopBackOff`? → logs.
-2. Check warm pool: `kubectl -n agent-pool get pods -l state=warm | wc -l`. Should be ≥ `agentPod.keda.minReplicas`.
-3. If pool is empty: `kubectl describe scaledobject agent-pod -n agent-pool` — KEDA scaler healthy?
-4. If KEDA is healthy but pods are `Pending`: spot capacity. Bump `agentPool` node-pool with on-demand fallback.
+1. Check orchestrator pod status. `CrashLoopBackOff`? → logs.
+2. Check warm pool: `kubectl -n agent-sandboxes get sandboxwarmpool -o wide`. Is `readyReplicas` near `replicas`?
+3. If the pool is empty/not filling: check the controller — `kubectl -n agent-sandbox-system logs deploy/agent-sandbox-controller --tail=100`. CRDs installed? (`kubectl get crd | grep agents.x-k8s.io`).
+4. If sandboxes are stuck `Pending`: node capacity. `kubectl -n agent-sandboxes describe sandbox <name>` for the `FailedScheduling` event; bump the node pool.
+5. Getting HTTP 429? Admission caps hit — raise `sandboxOrchestrator.concurrency.maxTotal` / `maxPerDev`.
 
 ### Model gateway 401s
 
@@ -86,22 +88,23 @@ curl -H "x-litellm-api-key: $LITELLM_MASTER_KEY" \
 - Check per-deployment TPM in Foundry portal. If saturating, add a second deployment in another region and update LiteLLM `config.yaml` to fall back.
 - Per-dev RPM cap in LiteLLM is too generous? Tighten `modelGateway.budgets.default.rpmLimit`.
 
-### Spot eviction storm
+### Sandboxes stuck Pending / pool not filling
 
-- Check Service Bus `agent-pod-claims` queue depth — if it's growing, KEDA is asking for pods that can't schedule.
-- Tactical: scale `agentPod` `nodeSelector` to a non-spot node pool (helm value override + `helm upgrade`).
-- Strategic: diversify spot SKUs in the AKS node pool spec.
+- Check the warm pool: `kubectl -n agent-sandboxes get sandboxwarmpool -o wide` — is `readyReplicas` climbing toward `replicas`?
+- Check the controller is healthy and has the `--extensions` flag: `kubectl -n agent-sandbox-system get deploy agent-sandbox-controller -o jsonpath='{.spec.template.spec.containers[0].args}'`.
+- Node capacity: `kubectl -n agent-sandboxes describe sandbox <name>` and look for `FailedScheduling`.
+- After editing the `SandboxTemplate`, live warm pods are NOT auto-recreated — delete them by name so the pool re-stamps: `kubectl -n agent-sandboxes delete sandbox <warm-pod-names>`.
 
 ## Scaling
 
-### Increase warm pool baseline
+### Increase warm pool / concurrency
 
 ```bash
 helm upgrade code-forge charts/code-forge \
   -f charts/code-forge/values-prod.yaml \
   --reuse-values \
-  --set agentPod.replicas=120 \
-  --set agentPod.keda.minReplicas=120
+  --set sandboxOrchestrator.sandbox.warmpoolReplicas=8 \
+  --set sandboxOrchestrator.concurrency.maxTotal=200
 ```
 
 ### Add a new model
@@ -120,8 +123,6 @@ NEW=$(openssl rand -hex 32)
 az keyvault secret set --vault-name kv-codeforge --name litellm-master --value "sk-$NEW"
 # CSI driver picks it up on next pod restart:
 kubectl -n platform rollout restart deploy/model-gateway
-# Cycle all virtual keys (router will mint new ones on next claim):
-kubectl -n agent-pool delete secret -l app=agent-pod
 ```
 
 ### TLS cert (quarterly, automated via cert-manager)
@@ -145,30 +146,32 @@ az identity federated-credential update \
 
 | Thing | Backup | RTO | RPO |
 |---|---|---|---|
-| Cosmos session audit | Continuous backup, 30 days | 15 min | 5 min |
-| Redis | Replication only — disposable | n/a | session-bound |
-| Workspace PVCs (Azure Files) | Snapshot daily | 1 h | 24 h |
+| Foundry usage / cost log (LiteLLM) | LiteLLM DB backup | 15 min | 5 min |
+| Sandboxes | Disposable — single-use, no durable state | n/a | n/a |
+| Optional per-dev PVCs (Azure Files) | Snapshot daily | 1 h | 24 h |
 | Key Vault | Soft-delete + purge protection (90 days) | 1 h | 0 |
 | ACR | Geo-replication to a paired region | n/a | tag-bound |
 | Helm release | `helm history` (in cluster) + chart in git | minutes | 0 |
 
-DR drill: quarterly. Restore Cosmos from PITR + redeploy the chart in the
-paired region's pre-built standby cluster.
+DR drill: quarterly. Redeploy the chart (+ agent-sandbox CRDs/controller) in the
+paired region's pre-built standby cluster; the warm pool re-fills automatically.
 
 ## Useful one-liners
 
 ```bash
-# How many devs are bound right now?
-kubectl -n agent-pool get pods -l state=bound -o jsonpath='{.items[*].metadata.labels.dev-id}' \
-  | tr ' ' '\n' | sort -u | wc -l
+# How many sandboxes are in flight right now?
+kubectl -n agent-sandboxes get sandboxclaims --no-headers | wc -l
+
+# Warm pool readiness
+kubectl -n agent-sandboxes get sandboxwarmpool -o jsonpath='{.items[0].status.readyReplicas}/{.items[0].status.replicas}'; echo
 
 # Top spenders this hour
 curl -H "x-litellm-api-key: $LITELLM_MASTER_KEY" \
   https://api.codeforge.example.com/spend/users \
   | jq 'sort_by(-.spend)[:10]'
 
-# Force-evict a stuck dev
-kubectl -n agent-pool label pod $POD state=cooldown --overwrite
+# Force-delete a stuck sandbox + its claim
+kubectl -n agent-sandboxes delete sandboxclaim <claim>; kubectl -n agent-sandboxes delete sandbox <name>
 
 # Drain a node gracefully
 kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --grace-period=120

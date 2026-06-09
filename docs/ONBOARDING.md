@@ -28,7 +28,7 @@ Read `CLAUDE.md` at the repo root for the full context. Then come back here.
 | `kubectl` ≥ 1.30 | Cluster ops | `brew install kubectl` |
 | `helm` ≥ 3.14 | Deploy the chart | `brew install helm` |
 | `bicep` | IaC | `az bicep install` |
-| `go` ≥ 1.22 | Session router | `brew install go` |
+| `python` ≥ 3.11 | Sandbox orchestrator | `brew install python` |
 | `claude` | The CLI itself, for local dev | `npm install -g @anthropic-ai/claude-code` |
 | VS Code + Dev Containers extension | Open `containers/agent-pod/.devcontainer` for prod-parity local dev | Marketplace |
 
@@ -124,10 +124,10 @@ Tag Roey or Michael for review. Merge bar: green CI + one review.
 
 ## 8 · Things that surprise people
 
-- **Pods are completely cattle.** Don't `kubectl exec` into one and `vim` config — your changes are gone in 15 min.
+- **Sandboxes are completely cattle.** Don't `kubectl exec` into one and `vim` config — it's single-use and gone the moment your request finishes.
 - **`api.anthropic.com` doesn't appear in our network policies.** Agents talk to the *gateway*, not Anthropic. The gateway then talks to *Foundry*, not Anthropic.
 - **Static API keys will fail review.** Workload Identity, every time. If you can't figure out how to wire it, ask — don't paper over with a key.
 - **`pod-security.kubernetes.io/enforce: restricted`** rejects images that run as root. If a build of yours pods-pending into oblivion, that's usually why.
-- **Spot nodes evict.** Don't write code that assumes a pod lives forever. Anything important goes in Redis / Cosmos / a PVC.
+- **The warm pool is a CRD, not a Deployment.** Sizing lives in `sandboxOrchestrator.sandbox.warmpoolReplicas`; editing the `SandboxTemplate` won't recycle live warm pods (delete them by name to re-stamp).
 
 Welcome aboard. 🛠️

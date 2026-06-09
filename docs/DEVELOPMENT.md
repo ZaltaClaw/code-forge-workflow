@@ -18,18 +18,18 @@ git commit -am "feat: <change>"
 gh pr create --fill
 ```
 
-CI runs: `helm lint`, `helm template`, `go build` (router), Bicep `what-if`,
+CI runs: `helm lint`, `helm template`, `pytest` (orchestrator), Bicep `what-if`,
 hadolint, and trivy on the resulting images. Green CI + 1 review = mergeable.
 
 ## Where to make each kind of change
 
 | You want to | Edit |
 |---|---|
-| Bump warm-pool size | `charts/code-forge/values.yaml` `agentPod.replicas` |
+| Bump warm-pool size | `charts/code-forge/values.yaml` `sandboxOrchestrator.sandbox.warmpoolReplicas` |
 | Add a model | `values.yaml` `global.foundry.models` + LiteLLM ConfigMap |
-| Add an env var to agent pods | `_helpers.tpl` (`code-forge.claudeCodeFoundryEnv`) |
+| Add an env var to agent sandboxes | `_helpers.tpl` (`code-forge.claudeCodeFoundryEnv`) |
 | Tighten a network rule | `templates/50-network-policies.yaml` |
-| Change router behavior | `containers/session-router/main.go` |
+| Change orchestrator behavior | `containers/sandbox-orchestrator/sandbox_orchestrator/` |
 | Add an Azure service | `infra/modules/<thing>.bicep` + reference from `main.bicep` |
 | Add a new doc | `docs/<TOPIC>.md` + link from root `CLAUDE.md` |
 
@@ -53,14 +53,15 @@ docker run --rm -it code-forge/agent-pod:dev claude --version
 code containers/agent-pod
 ```
 
-### 3. Session-router changes
+### 3. Sandbox-orchestrator changes
 
 ```bash
-cd containers/session-router
-go build ./...
-go test ./...
-# Run locally against fake redis + fake k8s:
-KUBECONFIG=/tmp/fake REDIS_URL=localhost:6379 ./session-router
+cd containers/sandbox-orchestrator
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+# Run locally against a kubeconfig (uses your current context):
+uvicorn sandbox_orchestrator.api:app --reload --port 8080
 ```
 
 ### 4. Bicep changes
@@ -92,15 +93,15 @@ Try:
 
 > /init                       — refresh CLAUDE.md if you've reorganized
 > /commands                   — list project-specific slash commands
-> Refactor the router idle reaper to use a wait group.
-> Find every place we hardcode 'agent-pool' and route it through values.yaml.
+> Refactor the orchestrator idle reaper to use an async task group.
+> Find every place we hardcode 'agent-sandboxes' and route it through values.yaml.
 
 The slash commands in `.claude/commands/` are tuned for the most common chores:
 
 - `/render-chart` — `helm template` with sane defaults
 - `/lint-everything` — runs all linters in parallel
 - `/new-doc <name>` — scaffold a new doc page with our format
-- `/build-images` — Docker build all three images
+- `/build-images` — Docker build all three images (agent-pod, sandbox-orchestrator, model-gateway)
 - `/security-review` — opens `docs/SECURITY.md` and asks Claude to red-team a change
 
 ## Style conventions
@@ -118,7 +119,7 @@ The slash commands in `.claude/commands/` are tuned for the most common chores:
 | Workflow | Trigger | Steps |
 |---|---|---|
 | `chart-ci.yaml` | PR touching `charts/**` | `helm lint`, `helm template`, kubeconform |
-| `router-ci.yaml` | PR touching `containers/session-router/**` | `go build`, `go test`, `golangci-lint` |
+| `orchestrator-ci.yaml` | PR touching `containers/sandbox-orchestrator/**` | `pytest`, `ruff`, `mypy` |
 | `image-ci.yaml` | PR touching `containers/**` | `hadolint`, `docker build`, `trivy` scan |
 | `bicep-ci.yaml` | PR touching `infra/**` | `bicep build`, `az deployment what-if` against a sandbox sub |
 | `release.yaml` | Tag push | Build + push images to ACR, helm package, helm push |
@@ -126,6 +127,6 @@ The slash commands in `.claude/commands/` are tuned for the most common chores:
 ## Testing strategy
 
 - **Helm**: `helm template | kubeconform` covers schema. Snapshot-test the rendered output for important diffs.
-- **Router**: unit tests with `httptest` + `client-go/testing.NewSimpleClientset()` + `miniredis`.
+- **Orchestrator**: unit tests with `pytest` + a fake kube backend; admission/concurrency caps and claim lifecycle are covered in `containers/sandbox-orchestrator/tests/`.
 - **Gateway**: integration test with a fake Foundry-like server that returns canned Anthropic responses.
-- **End-to-end**: spin up a kind cluster + install the chart against a dev Foundry resource. Run a synthetic claim → message → release loop.
+- **End-to-end**: spin up a kind cluster + install the agent-sandbox CRDs/controller + the chart against a dev Foundry resource. Run a synthetic provision → command → teardown loop.
