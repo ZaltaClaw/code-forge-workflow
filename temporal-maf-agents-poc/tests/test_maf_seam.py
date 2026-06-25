@@ -81,7 +81,7 @@ async def test_run_live_agent_raises_on_none_value(monkeypatch):
             return FakeAgent()
 
     monkeypatch.setattr(maf, "build_chat_client", lambda settings: FakeClient())
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="no schema-valid output"):
         await maf.run_live_agent(
             agent_name="x", instructions="i", prompt="p", response_model=object,
         )
