@@ -10,6 +10,10 @@ workflow code).
 
 from __future__ import annotations
 
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
 from shared.contracts import (
     ACTION_CONTINUE,
     STAGE_PLANNING,
@@ -49,5 +53,45 @@ def mock(request: AgentRequest) -> AgentOutput:
             "repo_url": request.repo_url,
             "environment": request.environment,
             "steps": plan,
+        },
+    )
+
+
+class PlannerResult(BaseModel):
+    """Structured planning output enforced via Azure OpenAI response_format."""
+
+    summary: str = Field(description="One-line summary of the plan")
+    steps: list[str] = Field(description="Ordered, concrete deployment steps")
+    risk_level: Literal["low", "medium", "high"]
+    rationale: str = Field(description="Why this plan and risk level")
+
+
+RESPONSE_MODEL = PlannerResult
+
+
+def build_prompt(request: AgentRequest) -> str:
+    return (
+        f"Engineering goal: {request.goal}\n"
+        f"Target repository: {request.repo_url}\n"
+        f"Environment: {request.environment}\n\n"
+        "Produce a concrete, ordered deployment plan and assess its risk."
+    )
+
+
+async def to_output(request: AgentRequest, parsed: PlannerResult) -> AgentOutput:
+    return AgentOutput(
+        agent_name=AGENT_NAME,
+        stage=STAGE_PLANNING,
+        status=STATUS_SUCCESS,
+        retryable=False,
+        summary=parsed.summary,
+        next_action=ACTION_CONTINUE,
+        details={
+            "goal": request.goal,
+            "repo_url": request.repo_url,
+            "environment": request.environment,
+            "steps": parsed.steps,
+            "risk_level": parsed.risk_level,
+            "rationale": parsed.rationale,
         },
     )

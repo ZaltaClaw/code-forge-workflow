@@ -42,6 +42,9 @@ async def run_planner_agent(request: AgentRequest) -> AgentOutput:
         instructions=agent.INSTRUCTIONS,
         request=request,
         mock=agent.mock,
+        build_prompt=agent.build_prompt,
+        response_model=agent.RESPONSE_MODEL,
+        to_output=agent.to_output,
     )
 
     log.info(
