@@ -1,0 +1,5 @@
+# Phase 2 live integrations. Install with: pip install -r requirements-live.txt
+-r requirements.txt
+agent-framework>=0.0.0a1
+azure-identity>=1.17
+PyGithub>=2.3

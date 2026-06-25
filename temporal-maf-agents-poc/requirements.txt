@@ -1,0 +1,4 @@
+# Phase 1 runtime (mock agents) + response-model definitions.
+temporalio>=1.7,<2
+python-dotenv>=1.0
+pydantic>=2.7

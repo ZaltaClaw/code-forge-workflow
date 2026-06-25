@@ -1,0 +1,46 @@
+[project]
+name = "temporal-maf-agents-poc"
+version = "0.1.0"
+description = "Durable multi-agent orchestration: Temporal + Microsoft Agent Framework on AKS, autoscaled by KEDA"
+requires-python = ">=3.10"
+dependencies = [
+    # Durable orchestration layer.
+    "temporalio>=1.7,<2",
+    # Microsoft Agent Framework — used ONLY inside Temporal activities.
+    # Phase 1 (AGENT_MODE=mock) does not import it at runtime; it is declared
+    # so Phase 2 (AGENT_MODE=live) works without changing dependencies.
+    "agent-framework>=0.0.0a1",
+    "python-dotenv>=1.0",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+# Phase 2 integrations (real Azure / GitHub / Kubernetes). Install on demand.
+live = [
+    "agent-framework>=0.0.0a1",
+    "azure-identity>=1.17",
+    "PyGithub>=2.3",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/shared",
+    "src/orchestrator_worker",
+    "src/planner_agent_worker",
+    "src/github_agent_worker",
+    "src/aks_agent_worker",
+    "src/approval_agent_worker",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
