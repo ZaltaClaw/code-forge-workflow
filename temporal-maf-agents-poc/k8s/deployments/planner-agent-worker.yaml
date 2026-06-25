@@ -1,0 +1,59 @@
+# Planner agent worker — `planner-agent-tq`. Replica count is owned by KEDA
+# (see k8s/keda/planner-agent-scaledobject.yaml); it scales 0..10 from the
+# task-queue backlog. Do not set `replicas` here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planner-agent-worker
+  namespace: agent-platform
+  labels:
+    app: planner-agent-worker
+    task-queue: planner-agent-tq
+spec:
+  selector:
+    matchLabels:
+      app: planner-agent-worker
+  template:
+    metadata:
+      labels:
+        app: planner-agent-worker
+        task-queue: planner-agent-tq
+    spec:
+      containers:
+        - name: worker
+          # TODO: replace with your registry image.
+          image: temporal-maf-agents-poc:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: temporal-config
+            # Requires the live-agents-secret — create it first from k8s/secrets/live-agents-secret.example.yaml
+            - secretRef:
+                name: live-agents-secret
+          env:
+            - name: WORKER_MODULE
+              value: planner_agent_worker.worker
+            - name: AGENT_MODE
+              value: live
+          ports:
+            - name: health
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
