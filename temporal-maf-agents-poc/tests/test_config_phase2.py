@@ -7,6 +7,7 @@ def test_phase2_defaults(monkeypatch):
     for var in (
         "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_CHAT_DEPLOYMENT",
         "AZURE_OPENAI_API_KEY", "GITHUB_TOKEN", "GITHUB_ALLOWED_OWNER",
+        "AZURE_OPENAI_API_VERSION",
     ):
         monkeypatch.delenv(var, raising=False)
     s = get_settings()

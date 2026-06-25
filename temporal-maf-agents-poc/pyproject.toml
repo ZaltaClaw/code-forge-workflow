@@ -6,10 +6,6 @@ requires-python = ">=3.10"
 dependencies = [
     # Durable orchestration layer.
     "temporalio>=1.7,<2",
-    # Microsoft Agent Framework — used ONLY inside Temporal activities.
-    # Phase 1 (AGENT_MODE=mock) does not import it at runtime; it is declared
-    # so Phase 2 (AGENT_MODE=live) works without changing dependencies.
-    "agent-framework>=0.0.0a1",
     "python-dotenv>=1.0",
     "pydantic>=2.7",
 ]
