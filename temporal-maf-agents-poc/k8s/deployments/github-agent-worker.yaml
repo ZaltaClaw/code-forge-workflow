@@ -27,9 +27,13 @@ spec:
           envFrom:
             - configMapRef:
                 name: temporal-config
+            - secretRef:
+                name: live-agents-secret
           env:
             - name: WORKER_MODULE
               value: github_agent_worker.worker
+            - name: AGENT_MODE
+              value: live
           ports:
             - name: health
               containerPort: 8080

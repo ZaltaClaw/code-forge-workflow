@@ -12,8 +12,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install deps first for layer caching.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+ARG INSTALL_LIVE=false
+COPY requirements.txt requirements-live.txt ./
+RUN if [ "$INSTALL_LIVE" = "true" ]; then \
+        pip install --no-cache-dir -r requirements-live.txt; \
+    else \
+        pip install --no-cache-dir -r requirements.txt; \
+    fi
 
 # App source.
 COPY src ./src
