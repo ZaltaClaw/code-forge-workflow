@@ -27,6 +27,7 @@ spec:
           envFrom:
             - configMapRef:
                 name: temporal-config
+            # Requires the live-agents-secret — create it first from k8s/secrets/live-agents-secret.example.yaml
             - secretRef:
                 name: live-agents-secret
           env:
