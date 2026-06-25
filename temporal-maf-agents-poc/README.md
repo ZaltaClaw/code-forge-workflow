@@ -250,19 +250,37 @@ Suggested metrics to scrape next (Temporal SDK + KEDA both export Prometheus):
 
 ---
 
-## Phase 2 — going live
+## Phase 2 — going live (Azure OpenAI + GitHub)
 
-Replace the mocks with real integrations **inside activities only**:
+The planner, github, and approval agents run real Azure OpenAI reasoning (via
+Microsoft Agent Framework) and the github agent makes real GitHub writes. The
+AKS agent stays mock.
 
-1. Implement `shared/maf.run_live_agent()` — build a real MAF agent
-   (`AzureOpenAIChatClient().as_agent(...)`, `await agent.run(prompt)`), parse
-   its output into the `AgentOutput` contract, and register the per-stage tools
-   (GitHub API / Kubernetes API / Azure) as MAF tools or MCP servers.
-2. Install the `live` extras: `pip install -e ".[live]"`.
-3. Set `AGENT_MODE=live` and the relevant Azure/GitHub/Kubernetes env vars.
+1. Install live deps: `pip install -r requirements-live.txt` (or `pip install -e ".[live]"`).
+2. Set env (see `.env.example`):
+   - `AGENT_MODE=live`
+   - `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_CHAT_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`
+   - Azure auth: set `AZURE_OPENAI_API_KEY`, **or** leave it unset and use
+     `DefaultAzureCredential` (`az login` locally / workload identity on AKS).
+   - `GITHUB_TOKEN` (fine-grained PAT) and `GITHUB_ALLOWED_OWNER` (the github
+     agent refuses to write unless the target repo's owner matches — fail-closed).
+3. Run workers + `python -m starter` as in Phase 1.
 
-Workflow code does **not** change — Temporal keeps orchestrating; only the
-activity bodies gain real side effects.
+What the github agent does: creates branch `feat/<request_id>`, commits
+`docs/agent-plan-<request_id>.md`, and opens a PR. All writes are idempotent, so
+Temporal activity retries converge instead of duplicating.
+
+Error handling: transient Azure/GitHub errors (5xx, rate limit, timeout, or a
+schema-invalid model response) are raised and retried by Temporal's activity
+retry policy; permanent errors (auth, missing repo, validation, guard violation)
+fail the workflow without pointless retries.
+
+Live on AKS: build the live image with `--build-arg INSTALL_LIVE=true`, apply
+`k8s/secrets/live-agents-secret.yaml`, and use the updated planner/github/approval
+deployments (which set `AGENT_MODE=live` and mount the secret).
+
+Tests: `pytest` runs everything with mocked clients (no creds). The opt-in live
+smoke test runs only with `RUN_LIVE_SMOKE=1` + real Azure env.
 
 ---
 
@@ -277,4 +295,4 @@ activity bodies gain real side effects.
 - [x] AKS manifests exist (`k8s/deployments/`)
 - [x] KEDA manifests exist (`k8s/keda/`)
 - [x] README with local and AKS deployment instructions
-- [ ] Phase 2 real integrations (TODO stubs in place)
+- [x] Phase 2 real integrations — Azure OpenAI + GitHub live (AKS still mock)
