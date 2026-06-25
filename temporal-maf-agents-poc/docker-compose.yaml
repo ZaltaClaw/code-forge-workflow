@@ -1,0 +1,123 @@
+# Local development stack:
+#   * Postgres            — Temporal persistence
+#   * Temporal server     — durable orchestration engine (frontend on :7233)
+#   * Temporal UI         — http://localhost:8233
+#   * temporal-setup      — one-shot: creates the `agent-platform` namespace
+#   * 5 worker services   — orchestrator + 4 agent workers, one per task queue
+#
+# Usage:
+#   docker compose up --build
+#   python -m starter            # (from another shell, with deps installed)
+#
+# All workers run AGENT_MODE=mock (Phase 1) — no cloud credentials required.
+name: temporal-maf-agents-poc
+
+x-worker-env: &worker-env
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: agent-platform
+  AGENT_MODE: mock
+  TEMPORAL_APPROVAL_AUTO: "true"
+  TEMPORAL_APPROVAL_TIMEOUT_SECONDS: "20"
+
+x-worker-common: &worker-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  depends_on:
+    temporal-setup:
+      condition: service_completed_successfully
+
+services:
+  postgresql:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - temporal-pg:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgresql
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test: ["CMD", "temporal", "workflow", "list", "--address", "temporal:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Creates the `agent-platform` namespace (auto-setup only creates `default`).
+  temporal-setup:
+    image: temporalio/admin-tools:1.25.2
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        temporal operator namespace describe --namespace agent-platform >/dev/null 2>&1
+        || temporal operator namespace create --namespace agent-platform --retention 72h;
+        echo "namespace agent-platform ready"
+    restart: "no"
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8233:8080"
+
+  orchestrator-worker:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      WORKER_MODULE: orchestrator_worker.worker
+
+  planner-agent-worker:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      WORKER_MODULE: planner_agent_worker.worker
+
+  github-agent-worker:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      WORKER_MODULE: github_agent_worker.worker
+
+  aks-agent-worker:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      WORKER_MODULE: aks_agent_worker.worker
+
+  approval-agent-worker:
+    <<: *worker-common
+    environment:
+      <<: *worker-env
+      WORKER_MODULE: approval_agent_worker.worker
+
+volumes:
+  temporal-pg:

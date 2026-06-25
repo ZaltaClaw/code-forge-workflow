@@ -1,0 +1,54 @@
+# Approval agent worker — `approval-agent-tq`. Replica count is owned by KEDA
+# (see k8s/keda/approval-agent-scaledobject.yaml); it scales 0..10 from the
+# task-queue backlog. Do not set `replicas` here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: approval-agent-worker
+  namespace: agent-platform
+  labels:
+    app: approval-agent-worker
+    task-queue: approval-agent-tq
+spec:
+  selector:
+    matchLabels:
+      app: approval-agent-worker
+  template:
+    metadata:
+      labels:
+        app: approval-agent-worker
+        task-queue: approval-agent-tq
+    spec:
+      containers:
+        - name: worker
+          # TODO: replace with your registry image.
+          image: temporal-maf-agents-poc:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: temporal-config
+          env:
+            - name: WORKER_MODULE
+              value: approval_agent_worker.worker
+          ports:
+            - name: health
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

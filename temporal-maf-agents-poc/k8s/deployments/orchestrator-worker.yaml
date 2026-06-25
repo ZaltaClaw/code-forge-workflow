@@ -1,0 +1,55 @@
+# Orchestrator worker — hosts the parent workflow on `orchestrator-tq`.
+# NOT autoscaled by KEDA: it must always be available to accept new
+# orchestrations and to run parent-workflow tasks. Keep >=1 replica.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator-worker
+  namespace: agent-platform
+  labels:
+    app: orchestrator-worker
+    task-queue: orchestrator-tq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator-worker
+  template:
+    metadata:
+      labels:
+        app: orchestrator-worker
+        task-queue: orchestrator-tq
+    spec:
+      containers:
+        - name: worker
+          # TODO: replace with your registry, e.g. youracr.azurecr.io/temporal-maf-agents-poc:latest
+          image: temporal-maf-agents-poc:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: temporal-config
+          env:
+            - name: WORKER_MODULE
+              value: orchestrator_worker.worker
+          ports:
+            - name: health
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

@@ -1,0 +1,70 @@
+{
+  "request_id": "req-001",
+  "status": "success",
+  "summary": "orchestration complete for goal: Add a /healthz endpoint to the payments service and deploy it",
+  "stages": [
+    {
+      "agent_name": "planner",
+      "stage": "planning",
+      "status": "success",
+      "retryable": false,
+      "summary": "deployment plan created",
+      "next_action": "continue",
+      "details": {
+        "goal": "Add a /healthz endpoint to the payments service and deploy it",
+        "repo_url": "https://github.com/example-org/payments-service",
+        "environment": "dev",
+        "steps": [
+          "Create feature branch for: Add a /healthz endpoint to the payments service and deploy it",
+          "Open a pull request against the target repository",
+          "Apply Kubernetes manifests to the 'dev' environment",
+          "Request human approval before promotion"
+        ]
+      }
+    },
+    {
+      "agent_name": "github",
+      "stage": "github",
+      "status": "success",
+      "retryable": false,
+      "summary": "opened pull request #1 on branch feat/req-001",
+      "next_action": "continue",
+      "details": {
+        "branch": "feat/req-001",
+        "pr_number": 1,
+        "pr_url": "https://github.com/example-org/payments-service/pull/1",
+        "based_on_plan": true
+      }
+    },
+    {
+      "agent_name": "aks",
+      "stage": "aks",
+      "status": "needs_approval",
+      "retryable": false,
+      "summary": "manifests staged; awaiting approval before promotion",
+      "next_action": "ask_human",
+      "details": {
+        "environment": "dev",
+        "applied": ["namespace/dev", "deployment/agent-app", "service/agent-app"],
+        "from_pr": 1,
+        "promotion_pending": true
+      }
+    },
+    {
+      "agent_name": "approval",
+      "stage": "approval",
+      "status": "success",
+      "retryable": false,
+      "summary": "approved — promotion authorised",
+      "next_action": "continue",
+      "details": {
+        "auto_approve": true,
+        "timeout_seconds": 20,
+        "environment": "dev",
+        "resolved": true,
+        "approved": true,
+        "reason": "auto-approved after timeout (non-prod POC policy)"
+      }
+    }
+  ]
+}

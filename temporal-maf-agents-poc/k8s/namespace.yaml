@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-platform
+  labels:
+    app.kubernetes.io/part-of: temporal-maf-agents-poc
+---
+# Shared Temporal connection settings for every worker deployment.
+# Point `TEMPORAL_ADDRESS` at your Temporal frontend Service. For the Temporal
+# Helm chart the default is "<release>-frontend.<namespace>:7233"; for Temporal
+# Cloud use "<your-namespace>.<account>.tmprl.cloud:7233" and add mTLS/API-key
+# auth to the workers + KEDA ScaledObjects (see TODOs in keda/*.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-config
+  namespace: agent-platform
+data:
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "agent-platform"
+  AGENT_MODE: "mock"
+  TEMPORAL_APPROVAL_AUTO: "true"
+  TEMPORAL_APPROVAL_TIMEOUT_SECONDS: "30"
+  HEALTH_PORT: "8080"
