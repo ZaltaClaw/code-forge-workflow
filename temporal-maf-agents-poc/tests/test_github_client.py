@@ -133,3 +133,15 @@ def test_create_pr_partial_retry_branch_exists_file_absent():
     repo.create_git_ref.assert_not_called()       # branch reused, not recreated
     repo.create_file.assert_called_once()          # file created this attempt
     repo.create_pull.assert_called_once()          # PR opened this attempt
+
+
+def test_rate_limit_propagates_as_transient():
+    from github import RateLimitExceededException
+    gh_client = MagicMock()
+    gh_client.get_repo.side_effect = RateLimitExceededException(403, {"message": "rate limited"}, {})
+    with pytest.raises(RateLimitExceededException):
+        gh.create_pr_with_plan(
+            repo_url="https://github.com/example-org/svc", request_id="req-1",
+            token="t", allowed_owner="example-org", pr_title="T", pr_body="B",
+            plan_markdown="x", commit_message="m", client_factory=lambda token: gh_client,
+        )

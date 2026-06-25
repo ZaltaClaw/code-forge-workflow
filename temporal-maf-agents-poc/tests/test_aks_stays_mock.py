@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from shared.contracts import STATUS_NEEDS_APPROVAL, STATUS_SUCCESS, AgentRequest
+from shared.contracts import STATUS_NEEDS_APPROVAL, AgentRequest
 from aks_agent_worker import agent
 from aks_agent_worker.activities import run_aks_agent
 

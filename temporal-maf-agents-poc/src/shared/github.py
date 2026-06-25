@@ -72,7 +72,7 @@ def create_pr_with_plan(
     Raises GitHubWriteNotAllowed / PermanentGitHubError for permanent failures;
     lets transient GithubException (5xx / rate limit) propagate for retry.
     """
-    from github import GithubException  # type: ignore
+    from github import GithubException, RateLimitExceededException  # type: ignore
 
     owner, repo_name = parse_owner_repo(repo_url)
     assert_write_allowed(owner, allowed_owner)
@@ -124,7 +124,9 @@ def create_pr_with_plan(
             "created_or_existed": created_or_existed,
         }
 
+    except RateLimitExceededException:
+        raise  # rate limited (403/429) -> transient -> Temporal retry
     except GithubException as exc:
         if getattr(exc, "status", None) in _PERMANENT_STATUS:
             raise PermanentGitHubError(f"GitHub {exc.status}: {exc.data}") from exc
-        raise  # transient (5xx, secondary rate limit) -> Temporal retry
+        raise  # transient (5xx) -> Temporal retry
